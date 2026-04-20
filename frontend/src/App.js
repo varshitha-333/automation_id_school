@@ -253,7 +253,7 @@ export default function App() {
       a.href = URL.createObjectURL(new Blob([data], { type: 'application/pdf' }));
       a.download = cls ? `ids_${cls}.pdf` : 'ids_ALL.pdf';
       a.click(); URL.revokeObjectURL(a.href);
-      addToast(`PDF downloaded (600 DPI)`, 'success');
+      addToast(`PDF downloaded`, 'success');
     } catch (e) {
       addToast('Download failed — check server', 'error');
     } finally { setCardLoading(null); }
@@ -302,7 +302,7 @@ export default function App() {
       a.href = URL.createObjectURL(new Blob([data], { type: 'application/pdf' }));
       a.download = `id_${studentName.replace(/\s+/g,'_')}.pdf`;
       a.click(); URL.revokeObjectURL(a.href);
-      addToast('Student card downloaded (600 DPI)', 'success');
+      addToast('Student card downloaded', 'success');
     } catch (e) {
       addToast('Download failed', 'error');
     } finally { setStudentLoading(null); }
@@ -461,14 +461,14 @@ export default function App() {
                         disabled={!!cardLoading}>
                   {cardLoading === 'all_view'
                     ? <><span className="btn-spinner"/> Generating preview…</>
-                    : <><Eye size={17}/> Preview All (300 DPI)</>}
+                    : <><Eye size={17}/> Preview All</>}
                 </button>
                 <button className="btn btn-green btn-lg"
                         onClick={() => downloadPDF(null)}
                         disabled={!!cardLoading}>
                   {cardLoading === 'all_dl'
                     ? <><span className="btn-spinner"/> Generating PDF…</>
-                    : <><Download size={17}/> Download All — 600 DPI</>}
+                    : <><Download size={17}/> Download All</>}
                 </button>
               </div>
 
@@ -538,14 +538,14 @@ export default function App() {
                       disabled={!studentName || !!studentLoading}>
                 {studentLoading === 'view'
                   ? <><span className="btn-spinner"/> Loading…</>
-                  : <><Eye size={16}/> View Card (300 DPI)</>}
+                  : <><Eye size={16}/> View Card</>}
               </button>
               <button className="btn btn-green btn-lg"
                       onClick={downloadStudent}
                       disabled={!studentName || !!studentLoading}>
                 {studentLoading === 'download'
                   ? <><span className="btn-spinner"/> Generating…</>
-                  : <><Download size={16}/> Download (600 DPI)</>}
+                  : <><Download size={16}/> Download</>}
               </button>
             </div>
           </div>
@@ -556,7 +556,7 @@ export default function App() {
       <footer className="app-footer">
         <span>ID Card Portal</span>
         <span className="footer-sep">·</span>
-        <span>Preview = 300 DPI &nbsp;|&nbsp; Download = 600 DPI</span>
+        <span>Preview &nbsp;|&nbsp; Download</span>
         <span className="footer-sep">·</span>
         <span>Flask + React</span>
       </footer>
