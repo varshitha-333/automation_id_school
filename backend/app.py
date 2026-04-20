@@ -13,9 +13,10 @@ import tempfile
 import requests
 from pathlib import Path
 from collections import defaultdict
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, after_this_request
 from flask_cors import CORS
 import pandas as pd
+import gc
 
 # ── Try importing PDF/image libs ─────────────────────────────────
 try:
@@ -27,6 +28,7 @@ except ImportError:
 try:
     from PIL import Image, ImageOps, ImageDraw, ImageFont
     HAS_PIL = True
+    Image.MAX_IMAGE_PIXELS = 20_000_000
 except ImportError:
     HAS_PIL = False
 
@@ -68,6 +70,40 @@ def class_sort_key(cls_str):
 
 # ── In-memory student store ───────────────────────────────────────
 _store = {"students": [], "source": None, "school_name": None}
+
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "12"))
+MAX_STUDENTS_PER_REQUEST = int(os.environ.get("MAX_STUDENTS_PER_REQUEST", "400"))
+PREVIEW_DPI = int(os.environ.get("PREVIEW_DPI", "180"))
+DOWNLOAD_DPI = int(os.environ.get("DOWNLOAD_DPI", "240"))
+PHOTO_TIMEOUT = (4, 10)
+MAX_PHOTO_BYTES = int(os.environ.get("MAX_PHOTO_BYTES", str(3 * 1024 * 1024)))
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+def replace_store(students, source, school_name):
+    old_students = _store.get("students") or []
+    if isinstance(old_students, list):
+        old_students.clear()
+    _store["students"] = list(students)
+    _store["source"] = source
+    _store["school_name"] = school_name
+    gc.collect()
+
+def filter_students_by_class(students, cls):
+    cls = (cls or "").strip().upper()
+    if not cls:
+        return list(students)
+    return [s for s in students if s.get("class", "").strip().upper() == cls]
+
+def choose_dpi(base_dpi, student_count):
+    if student_count > 250:
+        return min(base_dpi, 150)
+    if student_count > 150:
+        return min(base_dpi, 180)
+    if student_count > 80:
+        return min(base_dpi, 200)
+    if student_count > 40:
+        return min(base_dpi, 220)
+    return base_dpi
 
 # ─────────────────────────────────────────────────────────────────
 # HELPERS
@@ -113,12 +149,12 @@ def _sort_and_index(students):
     return students
 
 # ── Excel / CSV parser ────────────────────────────────────────────
-def parse_file(file_bytes, filename):
+def parse_file(file_path, filename):
     fn = filename.lower()
     if fn.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(file_bytes))
+        df = pd.read_csv(file_path)
     else:
-        df = pd.read_excel(io.BytesIO(file_bytes))
+        df = pd.read_excel(file_path)
     df.columns = [norm_key(c) for c in df.columns]
     students = []
     for _, row in df.iterrows():
@@ -196,16 +232,19 @@ def upload_file():
         return jsonify({"error": "No file"}), 400
     f = request.files["file"]
     print(f"DEBUG: File received: {f.filename}")
+    tmp_path = None
     try:
-        file_content = f.read()
-        print(f"DEBUG: File size: {len(file_content)} bytes")
-        students = parse_file(file_content, f.filename)
+        suffix = Path(f.filename or "upload.xlsx").suffix or ".xlsx"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            f.save(tmp_path)
+        file_size = os.path.getsize(tmp_path)
+        print(f"DEBUG: File size: {file_size} bytes")
+        students = parse_file(tmp_path, f.filename)
         print(f"DEBUG: Parsed {len(students)} students")
         if students:
             print(f"DEBUG: First student: {students[0]}")
-        _store["students"] = students
-        _store["source"] = "file"
-        _store["school_name"] = "Uploaded File"
+        replace_store(students, "file", "Uploaded File")
         print(f"DEBUG: Students stored in _store")
         return jsonify({
             "success": True,
@@ -216,6 +255,10 @@ def upload_file():
     except Exception as e:
         print(f"DEBUG: Upload error: {str(e)}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.unlink(tmp_path)
+            except: pass
 
 @app.route("/api/fetch-school/<int:school_id>", methods=["GET"])
 @app.route("/fetch-school/<int:school_id>", methods=["GET"])
@@ -250,9 +293,7 @@ def fetch_school(school_id):
         return jsonify({"error": "No valid students after mapping"}), 500
 
     students = _sort_and_index(students)
-    _store["students"] = students
-    _store["source"] = "api"
-    _store["school_name"] = SCHOOLS[school_id]
+    replace_store(students, "api", SCHOOLS[school_id])
     return jsonify({
         "success": True,
         "count": len(students),
@@ -363,23 +404,42 @@ TEARDROP_ITEMS = [
     ('c', (123.98969, 95.55492),(127.82469, 93.27335),(129.05914, 88.35811),(126.74588, 84.57169)),
 ]
 
-_photo_cache = {}
-
 def fetch_photo_data(url, target_w, target_h):
-    if not HAS_PIL: return None
-    img = None
+    if not HAS_PIL:
+        return None
+
+    def _fit_image(img_obj):
+        return ImageOps.fit(img_obj.convert("RGB"), (target_w, target_h), method=Image.Resampling.LANCZOS)
+
     if url:
-        if url not in _photo_cache:
-            try:
-                resp = requests.get(url, timeout=12); resp.raise_for_status()
-                _photo_cache[url] = Image.open(io.BytesIO(resp.content)).convert("RGB")
-            except: _photo_cache[url] = None
-        img = _photo_cache.get(url)
-    if img is None and FALLBACK_PHOTO.exists():
-        try: img = Image.open(str(FALLBACK_PHOTO)).convert("RGB")
-        except: pass
-    if img is None: img = Image.new("RGB", (target_w, target_h), (180, 200, 220))
-    return ImageOps.fit(img, (target_w, target_h), method=Image.Resampling.LANCZOS)
+        try:
+            resp = requests.get(url, timeout=PHOTO_TIMEOUT, stream=True)
+            resp.raise_for_status()
+            content_length = int(resp.headers.get("content-length") or 0)
+            if content_length and content_length > MAX_PHOTO_BYTES:
+                raise ValueError("photo too large")
+            chunks = []
+            total = 0
+            for chunk in resp.iter_content(64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_PHOTO_BYTES:
+                    raise ValueError("photo too large")
+                chunks.append(chunk)
+            with Image.open(io.BytesIO(b"".join(chunks))) as raw_img:
+                return _fit_image(raw_img)
+        except Exception:
+            pass
+
+    if FALLBACK_PHOTO.exists():
+        try:
+            with Image.open(str(FALLBACK_PHOTO)) as fallback_img:
+                return _fit_image(fallback_img)
+        except Exception:
+            pass
+
+    return Image.new("RGB", (target_w, target_h), (180, 200, 220))
 
 def _fit_size(font, text, max_width, base, min_size=4.0):
     s = base
@@ -534,9 +594,10 @@ def render_card_image(student, dpi=600):
         th = max(1, int(round((PHOTO_RECT.height / PT_PER_INCH) * dpi)))
         photo = fetch_photo_data(student.get("photo_url",""), tw, th)
         if photo:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                photo.save(tmp.name); page.insert_image(PHOTO_RECT, filename=tmp.name, overlay=True, keep_proportion=False)
-            os.unlink(tmp.name)
+            photo_buf = io.BytesIO()
+            photo.save(photo_buf, format="JPEG", quality=82, optimize=True)
+            page.insert_image(PHOTO_RECT, stream=photo_buf.getvalue(), overlay=True, keep_proportion=False)
+            photo.close()
 
     # Name
     draw_text_vertically_centered(page, NAME_TEXT_RECT,
@@ -589,7 +650,9 @@ def render_card_image(student, dpi=600):
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     doc.close()
     if HAS_PIL:
-        return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        pix = None
+        return img
     return pix
 
 def _placeholder_card(student, dpi=600):
@@ -648,8 +711,10 @@ def build_sheet_image(students_batch, dpi, batch_offset=0):
         x = offset_x+col*(card_w_px+col_gap_px); y = offset_y+row*(card_h_px+row_gap_px)
         card_img = render_card_image(data, dpi=dpi)
         if card_img:
-            card_img = card_img.resize((card_w_px, card_h_px), Image.Resampling.LANCZOS)
-            sheet.paste(card_img, (x, y))
+            resized = card_img.resize((card_w_px, card_h_px), Image.Resampling.LANCZOS)
+            sheet.paste(resized, (x, y))
+            resized.close()
+            card_img.close()
     for idx, data in enumerate(students_batch):
         col = idx%COLS; row = idx//COLS
         card_x = offset_x+col*(card_w_px+col_gap_px); card_y = offset_y+row*(card_h_px+row_gap_px)
@@ -659,23 +724,73 @@ def build_sheet_image(students_batch, dpi, batch_offset=0):
         draw_serial_badge(sheet, batch_offset+idx+1, card_x+card_w_px//2, (gap_top+gap_bottom)//2, badge_h_px)
     return sheet
 
-def build_pdf_bytes(students, dpi=600):
+def build_pdf_file(students, dpi=600):
     if not HAS_FITZ or not HAS_PIL:
         return None
     n_pages = (len(students)+CARDS_PER_PAGE-1)//CARDS_PER_PAGE
-    a4_w_pt = A4_W_MM*MM_TO_PT; a4_h_pt = A4_H_MM*MM_TO_PT
+    a4_w_pt = A4_W_MM*MM_TO_PT
+    a4_h_pt = A4_H_MM*MM_TO_PT
     out_doc = fitz.open()
-    for page_idx in range(n_pages):
-        bs = page_idx*CARDS_PER_PAGE; batch = students[bs:bs+CARDS_PER_PAGE]
-        sheet_img = build_sheet_image(batch, dpi, batch_offset=bs)
-        if sheet_img:
-            img_bytes = io.BytesIO(); sheet_img.save(img_bytes, format="PNG"); img_bytes.seek(0)
+    tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp_pdf.close()
+    try:
+        for page_idx in range(n_pages):
+            bs = page_idx * CARDS_PER_PAGE
+            batch = students[bs:bs+CARDS_PER_PAGE]
+            sheet_img = build_sheet_image(batch, dpi, batch_offset=bs)
+            if not sheet_img:
+                continue
+            img_bytes = io.BytesIO()
+            sheet_img.save(img_bytes, format="JPEG", quality=78, optimize=True)
+            sheet_img.close()
             pg = out_doc.new_page(width=a4_w_pt, height=a4_h_pt)
-            pg.insert_image(fitz.Rect(0,0,a4_w_pt,a4_h_pt), stream=img_bytes.read(), overlay=True, keep_proportion=False)
-    buf = io.BytesIO()
-    out_doc.save(buf, deflate=False, garbage=0, clean=False)
-    out_doc.close(); buf.seek(0)
-    return buf.read()
+            pg.insert_image(fitz.Rect(0, 0, a4_w_pt, a4_h_pt), stream=img_bytes.getvalue(), overlay=True, keep_proportion=False)
+            img_bytes.close()
+            gc.collect()
+        out_doc.save(tmp_pdf.name, deflate=True, garbage=4, clean=True)
+        return tmp_pdf.name
+    except Exception:
+        try:
+            if os.path.exists(tmp_pdf.name):
+                os.unlink(tmp_pdf.name)
+        except Exception:
+            pass
+        raise
+    finally:
+        out_doc.close()
+        gc.collect()
+
+def send_generated_pdf(students, dpi, download_name, as_attachment):
+    if not students:
+        return jsonify({"error": "No students loaded"}), 400
+    if len(students) > MAX_STUDENTS_PER_REQUEST:
+        return jsonify({
+            "error": f"Too many students in one request ({len(students)}). Please filter by class or increase MAX_STUDENTS_PER_REQUEST."
+        }), 413
+
+    safe_dpi = choose_dpi(dpi, len(students))
+    pdf_path = build_pdf_file(students, dpi=safe_dpi)
+    if not pdf_path:
+        return jsonify({"error": "PDF generation failed - check server libs"}), 500
+
+    @after_this_request
+    def cleanup(response):
+        try:
+            if os.path.exists(pdf_path):
+                os.unlink(pdf_path)
+        except Exception:
+            pass
+        gc.collect()
+        return response
+
+    return send_file(
+        pdf_path,
+        mimetype="application/pdf",
+        as_attachment=as_attachment,
+        download_name=download_name,
+        conditional=True,
+        max_age=0,
+    )
 
 # ─────────────────────────────────────────────────────────────────
 # PDF / PREVIEW ENDPOINTS
@@ -691,12 +806,8 @@ def preview_all():
         return jsonify({"error":"No students loaded"}),400
     print(f"DEBUG: Found {len(students)} students for preview")
     cls = request.args.get("class","").strip().upper()
-    if cls: students = [s for s in students if s.get("class","").strip().upper()==cls]
-    dpi = 300
-    pdf_data = build_pdf_bytes(students, dpi=dpi)
-    if not pdf_data: return jsonify({"error":"PDF generation failed - check server libs"}),500
-    return send_file(io.BytesIO(pdf_data), mimetype="application/pdf",
-                     as_attachment=False, download_name="preview.pdf")
+    students = filter_students_by_class(students, cls)
+    return send_generated_pdf(students, dpi=PREVIEW_DPI, download_name="preview.pdf", as_attachment=False)
 
 @app.route("/api/download/all", methods=["GET"])
 @app.route("/download/all", methods=["GET"])
@@ -709,14 +820,12 @@ def download_all():
     print(f"DEBUG: Found {len(students)} students for download")
     cls = request.args.get("class","").strip().upper()
     if cls:
-        students = [s for s in students if s.get("class","").strip().upper()==cls]
+        students = filter_students_by_class(students, cls)
         fname = f"ids_{cls}.pdf"
     else:
+        students = list(students)
         fname = "ids_ALL.pdf"
-    pdf_data = build_pdf_bytes(students, dpi=600)
-    if not pdf_data: return jsonify({"error":"PDF generation failed"}),500
-    return send_file(io.BytesIO(pdf_data), mimetype="application/pdf",
-                     as_attachment=True, download_name=fname)
+    return send_generated_pdf(students, dpi=DOWNLOAD_DPI, download_name=fname, as_attachment=True)
 
 @app.route("/api/preview/student", methods=["GET"])
 @app.route("/preview/student", methods=["GET"])
@@ -730,10 +839,7 @@ def preview_student():
                and name == s.get("student_name","").strip().lower()]
     if not matches: return jsonify({"error":"Student not found"}),404
     student = matches[0]
-    pdf_data = build_pdf_bytes([student], dpi=300)
-    if not pdf_data: return jsonify({"error":"PDF generation failed"}),500
-    return send_file(io.BytesIO(pdf_data), mimetype="application/pdf",
-                     as_attachment=False, download_name="preview_student.pdf")
+    return send_generated_pdf([student], dpi=PREVIEW_DPI, download_name="preview_student.pdf", as_attachment=False)
 
 @app.route("/api/download/student", methods=["GET"])
 @app.route("/download/student", methods=["GET"])
@@ -747,11 +853,8 @@ def download_student():
                and name == s.get("student_name","").strip().lower()]
     if not matches: return jsonify({"error":"Student not found"}),404
     student = matches[0]
-    pdf_data = build_pdf_bytes([student], dpi=600)
-    if not pdf_data: return jsonify({"error":"PDF generation failed"}),500
     safe_name = student.get("student_name","student").replace(" ","_")
-    return send_file(io.BytesIO(pdf_data), mimetype="application/pdf",
-                     as_attachment=True, download_name=f"id_{safe_name}.pdf")
+    return send_generated_pdf([student], dpi=DOWNLOAD_DPI, download_name=f"id_{safe_name}.pdf", as_attachment=True)
 
 if __name__ == "__main__":
     checkmark = '\u2713'
