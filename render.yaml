@@ -1,0 +1,26 @@
+services:
+  # Frontend Service
+  - type: web
+    name: id-card-frontend
+    env: static
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: frontend/build
+    routes:
+      - route: /*/*
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+  # Backend Service
+  - type: web
+    name: id-card-backend
+    env: python
+    buildCommand: cd backend && pip install -r requirements.txt
+    startCommand: cd backend && python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9
+      - key: PORT
+        value: 5000
+      - key: FLASK_ENV
+        value: production
