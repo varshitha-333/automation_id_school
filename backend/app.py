@@ -698,13 +698,15 @@ def download_student():
                      as_attachment=True, download_name=f"id_{safe_name}.pdf")
 
 if __name__ == "__main__":
+    checkmark = '\u2713'
+    xmark = '\u2717'
     print("=" * 55)
     print("  ID Card Generator Backend  v1.0")
-    print(f"  Template PDF: {'\u2713 found' if TEMPLATE_PDF.exists() else '\u2717 NOT FOUND'}")
-    print(f"  Anton font:   {'\u2713 found' if ANTON_FONT.exists() else '\u2717 NOT FOUND'}")
-    print(f"  Arial Bold:   {'\u2713 found' if ARIAL_BOLD.exists() else '\u2717 NOT FOUND'}")
-    print(f"  PyMuPDF:      {'\u2713' if HAS_FITZ else '\u2717 pip install pymupdf'}")
-    print(f"  Pillow:       {'\u2713' if HAS_PIL else '\u2717 pip install pillow'}")
+    print(f"  Template PDF: {checkmark + ' found' if TEMPLATE_PDF.exists() else xmark + ' NOT FOUND'}")
+    print(f"  Anton font:   {checkmark + ' found' if ANTON_FONT.exists() else xmark + ' NOT FOUND'}")
+    print(f"  Arial Bold:   {checkmark + ' found' if ARIAL_BOLD.exists() else xmark + ' NOT FOUND'}")
+    print(f"  PyMuPDF:      {checkmark if HAS_FITZ else xmark + ' pip install pymupdf'}")
+    print(f"  Pillow:       {checkmark if HAS_PIL else xmark + ' pip install pillow'}")
     print("=" * 55)
     
     # Production-ready port configuration
