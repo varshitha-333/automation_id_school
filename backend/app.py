@@ -168,6 +168,15 @@ def map_api_record(record):
 # ROUTES
 # ─────────────────────────────────────────────────────────────────
 
+# Health check endpoints for Render
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"status": "ok", "message": "ID Card Generator API is running"})
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "message": "ID Card Generator API is healthy"})
+
 @app.route("/api/schools", methods=["GET"])
 def get_schools():
     return jsonify([{"id": k, "name": v} for k, v in SCHOOLS.items()])
@@ -672,7 +681,7 @@ def preview_student():
     if not students: return jsonify({"error":"No students loaded"}),400
     matches = [s for s in students
                if s.get("class","").strip().upper()==cls
-               and name in s.get("student_name","").strip().lower()]
+               and name == s.get("student_name","").strip().lower()]
     if not matches: return jsonify({"error":"Student not found"}),404
     student = matches[0]
     pdf_data = build_pdf_bytes([student], dpi=300)
@@ -688,7 +697,7 @@ def download_student():
     if not students: return jsonify({"error":"No students loaded"}),400
     matches = [s for s in students
                if s.get("class","").strip().upper()==cls
-               and name in s.get("student_name","").strip().lower()]
+               and name == s.get("student_name","").strip().lower()]
     if not matches: return jsonify({"error":"Student not found"}),404
     student = matches[0]
     pdf_data = build_pdf_bytes([student], dpi=600)
