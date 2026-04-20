@@ -260,26 +260,33 @@ def fetch_school(school_id):
 
 @app.route("/api/students", methods=["GET"])
 def get_students():
+    print(f"DEBUG: Students endpoint called")
     cls = request.args.get("class","").strip().upper()
     students = _store["students"]
-    if cls:
-        students = [s for s in students if s.get("class","").strip().upper() == cls]
+    print(f"DEBUG: Store contains {len(students)} students")
+    if cls: students = [s for s in students if s.get("class","").strip().upper() == cls]
+    print(f"DEBUG: Filtered to {len(students)} students for class {cls}")
     return jsonify(students)
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
+    print(f"DEBUG: Status endpoint called")
     students = _store["students"]
+    print(f"DEBUG: Store contains {len(students)} students")
     if not students:
+        print(f"DEBUG: No students found in store")
         return jsonify({"loaded": False})
     cls_list = sorted(set(s.get("class","").strip().upper() for s in students), key=class_sort_key)
     session_val = students[0].get("session", DEFAULT_SESSION) if students else DEFAULT_SESSION
+    print(f"DEBUG: School name: {_store.get('school_name','')}")
+    print(f"DEBUG: Source: {_store.get('source','')}")
     return jsonify({
         "loaded": True,
         "count": len(students),
+        "school": _store.get("school_name",""),
+        "source": _store.get("source",""),
         "classes": cls_list,
         "session": session_val,
-        "source": _store["source"],
-        "school_name": _store["school_name"],
     })
 
 def _classes_summary(students):
