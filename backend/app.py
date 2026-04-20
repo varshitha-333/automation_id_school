@@ -10,6 +10,7 @@ import json
 import math
 import base64
 import tempfile
+import uuid
 import requests
 from pathlib import Path
 from collections import defaultdict
@@ -72,11 +73,24 @@ def class_sort_key(cls_str):
 _store = {"students": [], "source": None, "school_name": None}
 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "12"))
-MAX_STUDENTS_PER_REQUEST = int(os.environ.get("MAX_STUDENTS_PER_REQUEST", "400"))
-PREVIEW_DPI = int(os.environ.get("PREVIEW_DPI", "180"))
-DOWNLOAD_DPI = int(os.environ.get("DOWNLOAD_DPI", "240"))
+MAX_STUDENTS_PER_REQUEST = int(os.environ.get("MAX_STUDENTS_PER_REQUEST", "1000"))
+PREVIEW_DPI = int(os.environ.get("PREVIEW_DPI", "300"))
+DOWNLOAD_DPI = int(os.environ.get("DOWNLOAD_DPI", "600"))
 PHOTO_TIMEOUT = (4, 10)
 MAX_PHOTO_BYTES = int(os.environ.get("MAX_PHOTO_BYTES", str(3 * 1024 * 1024)))
+PDF_TEMP_DIR = os.environ.get("PDF_TEMP_DIR", tempfile.gettempdir())
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "generated-pdfs")
+SUPABASE_SIGNED_URL_TTL = int(os.environ.get("SUPABASE_SIGNED_URL_TTL", "3600"))
+
+GOOGLE_DRIVE_CLIENT_ID = os.environ.get("GOOGLE_DRIVE_CLIENT_ID", "")
+GOOGLE_DRIVE_CLIENT_SECRET = os.environ.get("GOOGLE_DRIVE_CLIENT_SECRET", "")
+GOOGLE_DRIVE_REFRESH_TOKEN = os.environ.get("GOOGLE_DRIVE_REFRESH_TOKEN", "")
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
+
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 def replace_store(students, source, school_name):
@@ -95,15 +109,138 @@ def filter_students_by_class(students, cls):
     return [s for s in students if s.get("class", "").strip().upper() == cls]
 
 def choose_dpi(base_dpi, student_count):
-    if student_count > 250:
-        return min(base_dpi, 150)
-    if student_count > 150:
-        return min(base_dpi, 180)
-    if student_count > 80:
-        return min(base_dpi, 200)
-    if student_count > 40:
-        return min(base_dpi, 220)
     return base_dpi
+
+def _sanitize_filename(name):
+    keep = []
+    for ch in str(name or "file.pdf"):
+        if ch.isalnum() or ch in ("-", "_", "."):
+            keep.append(ch)
+        elif ch.isspace():
+            keep.append("_")
+    cleaned = "".join(keep).strip("._") or "file"
+    if not cleaned.lower().endswith(".pdf"):
+        cleaned += ".pdf"
+    return cleaned
+
+def _external_storage_enabled():
+    if STORAGE_BACKEND == "supabase":
+        return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET)
+    if STORAGE_BACKEND == "google_drive":
+        return bool(GOOGLE_DRIVE_CLIENT_ID and GOOGLE_DRIVE_CLIENT_SECRET and GOOGLE_DRIVE_REFRESH_TOKEN)
+    return False
+
+def _google_access_token():
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": GOOGLE_DRIVE_CLIENT_ID,
+            "client_secret": GOOGLE_DRIVE_CLIENT_SECRET,
+            "refresh_token": GOOGLE_DRIVE_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    token = resp.json().get("access_token")
+    if not token:
+        raise RuntimeError("Google Drive token refresh failed")
+    return token
+
+def _upload_to_google_drive(local_path, download_name):
+    token = _google_access_token()
+    metadata = {"name": _sanitize_filename(download_name)}
+    if GOOGLE_DRIVE_FOLDER_ID:
+        metadata["parents"] = [GOOGLE_DRIVE_FOLDER_ID]
+
+    start = requests.post(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "application/pdf",
+        },
+        data=json.dumps(metadata),
+        timeout=30,
+    )
+    start.raise_for_status()
+    session_url = start.headers.get("Location")
+    if not session_url:
+        raise RuntimeError("Google Drive resumable upload URL missing")
+
+    file_size = os.path.getsize(local_path)
+    with open(local_path, "rb") as fh:
+        uploaded = requests.put(
+            session_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/pdf",
+                "Content-Length": str(file_size),
+            },
+            data=fh,
+            timeout=300,
+        )
+    uploaded.raise_for_status()
+    data = uploaded.json()
+    file_id = data.get("id")
+    if not file_id:
+        raise RuntimeError("Google Drive file id missing")
+
+    perm = requests.post(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        params={"fields": "id"},
+        data=json.dumps({"role": "reader", "type": "anyone"}),
+        timeout=30,
+    )
+    perm.raise_for_status()
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+def _upload_to_supabase(local_path, download_name):
+    object_name = f"generated/{uuid.uuid4().hex}_{_sanitize_filename(download_name)}"
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{object_name}"
+    with open(local_path, "rb") as fh:
+        up = requests.post(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "x-upsert": "true",
+                "Content-Type": "application/pdf",
+            },
+            data=fh,
+            timeout=300,
+        )
+    up.raise_for_status()
+
+    sign = requests.post(
+        f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{object_name}",
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({"expiresIn": SUPABASE_SIGNED_URL_TTL}),
+        timeout=30,
+    )
+    sign.raise_for_status()
+    payload = sign.json()
+    signed = payload.get("signedURL") or payload.get("signedUrl")
+    if not signed:
+        raise RuntimeError("Supabase signed URL missing")
+    if signed.startswith("http"):
+        return signed
+    return f"{SUPABASE_URL}/storage/v1{signed}"
+
+def upload_pdf_to_external_storage(local_path, download_name):
+    if STORAGE_BACKEND == "google_drive":
+        return _upload_to_google_drive(local_path, download_name)
+    if STORAGE_BACKEND == "supabase":
+        return _upload_to_supabase(local_path, download_name)
+    return None
 
 # ─────────────────────────────────────────────────────────────────
 # HELPERS
@@ -731,7 +868,7 @@ def build_pdf_file(students, dpi=600):
     a4_w_pt = A4_W_MM*MM_TO_PT
     a4_h_pt = A4_H_MM*MM_TO_PT
     out_doc = fitz.open()
-    tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=PDF_TEMP_DIR)
     tmp_pdf.close()
     try:
         for page_idx in range(n_pages):
@@ -760,7 +897,7 @@ def build_pdf_file(students, dpi=600):
         out_doc.close()
         gc.collect()
 
-def send_generated_pdf(students, dpi, download_name, as_attachment):
+def send_generated_pdf(students, dpi, download_name, as_attachment, allow_external=False):
     if not students:
         return jsonify({"error": "No students loaded"}), 400
     if len(students) > MAX_STUDENTS_PER_REQUEST:
@@ -782,6 +919,19 @@ def send_generated_pdf(students, dpi, download_name, as_attachment):
             pass
         gc.collect()
         return response
+
+    if allow_external and _external_storage_enabled():
+        try:
+            remote_url = upload_pdf_to_external_storage(pdf_path, download_name)
+            if remote_url:
+                return jsonify({
+                    "success": True,
+                    "storage": STORAGE_BACKEND,
+                    "download_url": remote_url,
+                    "download_name": download_name,
+                })
+        except Exception as e:
+            print(f"DEBUG: External storage upload failed: {e}")
 
     return send_file(
         pdf_path,
@@ -825,7 +975,7 @@ def download_all():
     else:
         students = list(students)
         fname = "ids_ALL.pdf"
-    return send_generated_pdf(students, dpi=DOWNLOAD_DPI, download_name=fname, as_attachment=True)
+    return send_generated_pdf(students, dpi=DOWNLOAD_DPI, download_name=fname, as_attachment=True, allow_external=True)
 
 @app.route("/api/preview/student", methods=["GET"])
 @app.route("/preview/student", methods=["GET"])
@@ -854,7 +1004,7 @@ def download_student():
     if not matches: return jsonify({"error":"Student not found"}),404
     student = matches[0]
     safe_name = student.get("student_name","student").replace(" ","_")
-    return send_generated_pdf([student], dpi=DOWNLOAD_DPI, download_name=f"id_{safe_name}.pdf", as_attachment=True)
+    return send_generated_pdf([student], dpi=DOWNLOAD_DPI, download_name=f"id_{safe_name}.pdf", as_attachment=True, allow_external=True)
 
 if __name__ == "__main__":
     checkmark = '\u2713'

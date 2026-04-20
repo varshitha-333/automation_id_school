@@ -17,6 +17,33 @@ const normalizeApiBase = (rawValue) => {
 
 const API = normalizeApiBase(process.env.REACT_APP_API_URL || '/api');
 
+const openExternalOrBlob = async (resp, fallbackName, onPreview) => {
+  const contentType = (resp.headers?.['content-type'] || resp.data?.type || '').toLowerCase();
+  if (contentType.includes('application/json')) {
+    const text = await resp.data.text();
+    const payload = JSON.parse(text || '{}');
+    if (payload.download_url) {
+      if (onPreview) onPreview(payload.download_url);
+      else window.open(payload.download_url, '_blank', 'noopener,noreferrer');
+      return { external: true, payload };
+    }
+    throw new Error(payload.error || 'External file URL was not returned');
+  }
+
+  const blobUrl = URL.createObjectURL(new Blob([resp.data], { type: 'application/pdf' }));
+  if (onPreview) {
+    onPreview(blobUrl);
+    return { external: false, blobUrl };
+  }
+
+  const a = document.createElement('a');
+  a.href = blobUrl;
+  a.download = fallbackName;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  return { external: false, blobUrl };
+};
+
 // ─── Toast ────────────────────────────────────────────────────────
 function Toast({ toasts, removeToast }) {
   return (
@@ -255,12 +282,9 @@ export default function App() {
     setCardLoading(key);
     try {
       const url = cls ? `${API}/download/all?class=${cls}` : `${API}/download/all`;
-      const { data } = await axios.get(url, { responseType: 'blob' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([data], { type: 'application/pdf' }));
-      a.download = cls ? `ids_${cls}.pdf` : 'ids_ALL.pdf';
-      a.click(); URL.revokeObjectURL(a.href);
-      addToast(`PDF downloaded`, 'success');
+      const resp = await axios.get(url, { responseType: 'blob' });
+      const result = await openExternalOrBlob(resp, cls ? `ids_${cls}.pdf` : 'ids_ALL.pdf');
+      addToast(result.external ? 'PDF generated and opened from cloud storage' : 'PDF downloaded', 'success');
     } catch (e) {
       addToast('Download failed — check server', 'error');
     } finally { setCardLoading(null); }
@@ -273,8 +297,9 @@ export default function App() {
       const url = cls ? `${API}/preview/all?class=${cls}` : `${API}/preview/all`;
       // Get the PDF as a blob URL for the modal
       const resp = await axios.get(url, { responseType: 'blob' });
-      const blobUrl = URL.createObjectURL(new Blob([resp.data], { type: 'application/pdf' }));
-      setModal({ url: blobUrl, title: cls ? `Class ${cls} — Preview` : 'All Students — Preview' });
+      await openExternalOrBlob(resp, 'preview.pdf', (urlToOpen) => {
+        setModal({ url: urlToOpen, title: cls ? `Class ${cls} — Preview` : 'All Students — Preview' });
+      });
     } catch (e) {
       addToast('Preview failed — check server', 'error');
     } finally { setCardLoading(null); }
@@ -293,8 +318,9 @@ export default function App() {
     setStudentLoading('view');
     try {
       const resp = await axios.get(`${API}/preview/student?class=${studentClass}&name=${encodeURIComponent(studentName)}`, { responseType: 'blob' });
-      const blobUrl = URL.createObjectURL(new Blob([resp.data], { type: 'application/pdf' }));
-      setModal({ url: blobUrl, title: `${studentName} — Preview` });
+      await openExternalOrBlob(resp, 'preview_student.pdf', (urlToOpen) => {
+        setModal({ url: urlToOpen, title: `${studentName} — Preview` });
+      });
     } catch (e) {
       addToast(e.response?.data?.error || 'Preview failed', 'error');
     } finally { setStudentLoading(null); }
@@ -304,12 +330,9 @@ export default function App() {
     if (!studentClass || !studentName) { addToast('Select class and student name', 'error'); return; }
     setStudentLoading('download');
     try {
-      const { data } = await axios.get(`${API}/download/student?class=${studentClass}&name=${encodeURIComponent(studentName)}`, { responseType: 'blob' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([data], { type: 'application/pdf' }));
-      a.download = `id_${studentName.replace(/\s+/g,'_')}.pdf`;
-      a.click(); URL.revokeObjectURL(a.href);
-      addToast('Student card downloaded', 'success');
+      const resp = await axios.get(`${API}/download/student?class=${studentClass}&name=${encodeURIComponent(studentName)}`, { responseType: 'blob' });
+      const result = await openExternalOrBlob(resp, `id_${studentName.replace(/\s+/g,'_')}.pdf`);
+      addToast(result.external ? 'Student card generated and opened from cloud storage' : 'Student card downloaded', 'success');
     } catch (e) {
       addToast('Download failed', 'error');
     } finally { setStudentLoading(null); }
