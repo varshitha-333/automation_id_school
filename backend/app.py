@@ -32,7 +32,12 @@ except ImportError:
 
 # ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)
+CORS(app, 
+     origins=["*"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+     supports_credentials=True,
+     expose_headers=["Content-Disposition", "Content-Type"])
 
 BASE_DIR     = Path(__file__).parent
 TEMPLATE_PDF = BASE_DIR / "template_id_card.pdf"
