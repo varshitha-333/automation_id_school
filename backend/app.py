@@ -183,10 +183,12 @@ def health():
     return jsonify({"status": "ok", "message": "ID Card Generator API is healthy"})
 
 @app.route("/api/schools", methods=["GET"])
+@app.route("/schools", methods=["GET"])
 def get_schools():
     return jsonify([{"id": k, "name": v} for k, v in SCHOOLS.items()])
 
 @app.route("/api/upload", methods=["POST"])
+@app.route("/upload", methods=["POST"])
 def upload_file():
     print(f"DEBUG: Upload endpoint called")
     if "file" not in request.files:
@@ -216,6 +218,7 @@ def upload_file():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/fetch-school/<int:school_id>", methods=["GET"])
+@app.route("/fetch-school/<int:school_id>", methods=["GET"])
 def fetch_school(school_id):
     if school_id not in SCHOOLS:
         return jsonify({"error": "Unknown school"}), 400
@@ -259,6 +262,7 @@ def fetch_school(school_id):
     })
 
 @app.route("/api/students", methods=["GET"])
+@app.route("/students", methods=["GET"])
 def get_students():
     print(f"DEBUG: Students endpoint called")
     cls = request.args.get("class","").strip().upper()
@@ -269,6 +273,7 @@ def get_students():
     return jsonify(students)
 
 @app.route("/api/status", methods=["GET"])
+@app.route("/status", methods=["GET"])
 def get_status():
     print(f"DEBUG: Status endpoint called")
     students = _store["students"]
@@ -280,12 +285,20 @@ def get_status():
     session_val = students[0].get("session", DEFAULT_SESSION) if students else DEFAULT_SESSION
     print(f"DEBUG: School name: {_store.get('school_name','')}")
     print(f"DEBUG: Source: {_store.get('source','')}")
+    class_counts = {}
+    for s in students:
+        cls_key = s.get("class", "").strip().upper()
+        if cls_key:
+            class_counts[cls_key] = class_counts.get(cls_key, 0) + 1
+    school_name = _store.get("school_name","")
     return jsonify({
         "loaded": True,
         "count": len(students),
-        "school": _store.get("school_name",""),
+        "school": school_name,
+        "school_name": school_name,
         "source": _store.get("source",""),
         "classes": cls_list,
+        "classCounts": class_counts,
         "session": session_val,
     })
 
@@ -669,6 +682,7 @@ def build_pdf_bytes(students, dpi=600):
 # ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/preview/all", methods=["GET"])
+@app.route("/preview/all", methods=["GET"])
 def preview_all():
     print(f"DEBUG: Preview all endpoint called")
     students = _store["students"]
@@ -685,6 +699,7 @@ def preview_all():
                      as_attachment=False, download_name="preview.pdf")
 
 @app.route("/api/download/all", methods=["GET"])
+@app.route("/download/all", methods=["GET"])
 def download_all():
     print(f"DEBUG: Download all endpoint called")
     students = _store["students"]
@@ -704,6 +719,7 @@ def download_all():
                      as_attachment=True, download_name=fname)
 
 @app.route("/api/preview/student", methods=["GET"])
+@app.route("/preview/student", methods=["GET"])
 def preview_student():
     students = _store["students"]
     cls  = request.args.get("class","").strip().upper()
@@ -720,6 +736,7 @@ def preview_student():
                      as_attachment=False, download_name="preview_student.pdf")
 
 @app.route("/api/download/student", methods=["GET"])
+@app.route("/download/student", methods=["GET"])
 def download_student():
     students = _store["students"]
     cls  = request.args.get("class","").strip().upper()
@@ -750,5 +767,5 @@ if __name__ == "__main__":
     
     # Production-ready port configuration
     port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('FLASK_ENV') != 'production'
-    app.run(debug=debug, host='0.0.0.0', port=port)
+    debug = os.environ.get('FLASK_DEBUG', '').strip() == '1'
+    app.run(debug=debug, use_reloader=debug, host='0.0.0.0', port=port)

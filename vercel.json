@@ -16,8 +16,9 @@
   "routes": [
     {
       "src": "/api/(.*)",
-      "dest": "/backend/app.py"
+      "dest": "app.py"
     },
+    
     {
       "src": "/(.*)",
       "dest": "/frontend/$1"
@@ -26,4 +27,5 @@
   "env": {
     "PYTHON_VERSION": "3.9"
   }
+  
 }

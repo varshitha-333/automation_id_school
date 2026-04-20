@@ -8,7 +8,14 @@ import {
 } from 'lucide-react';
 import './App.css';
 
-const API = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+const normalizeApiBase = (rawValue) => {
+  const value = (rawValue || '').trim();
+  if (!value) return '/api';
+  const cleaned = value.replace(/\/+$/, '');
+  return cleaned.endsWith('/api') ? cleaned : `${cleaned}/api`;
+};
+
+const API = normalizeApiBase(process.env.REACT_APP_API_URL || '/api');
 
 // ─── Toast ────────────────────────────────────────────────────────
 function Toast({ toasts, removeToast }) {
@@ -212,7 +219,7 @@ export default function App() {
       const counts = {};
       data.classes.forEach(c => { counts[c.class] = c.count; });
       setStatus({ loaded: true, count: data.count, classes: data.classes.map(c=>c.class),
-                  classCounts: counts, session: data.session, source: 'file', school_name: 'Uploaded File' });
+                  classCounts: counts, session: data.session, source: 'file', school: 'Uploaded File', school_name: 'Uploaded File' });
       addToast(`✓ Imported ${data.count} students across ${data.classes.length} classes`, 'success', 5000);
       setStudentClass(''); setStudentName(''); setStudentNames([]);
     } catch (e) {
@@ -234,7 +241,7 @@ export default function App() {
       const counts = {};
       data.classes.forEach(c => { counts[c.class] = c.count; });
       setStatus({ loaded: true, count: data.count, classes: data.classes.map(c=>c.class),
-                  classCounts: counts, session: data.session, source: 'api', school_name: data.school });
+                  classCounts: counts, session: data.session, source: 'api', school: data.school, school_name: data.school });
       addToast(`✓ Fetched ${data.count} students from ${data.school}`, 'success', 5000);
       setStudentClass(''); setStudentName(''); setStudentNames([]);
     } catch (e) {
@@ -340,7 +347,7 @@ export default function App() {
             {status.loaded && (
               <div className="loaded-badge">
                 <CheckCircle2 size={13}/>
-                {' '}{status.source === 'api' ? status.school_name : 'File loaded'}
+                {' '}{status.source === 'api' ? (status.school_name || status.school || 'School loaded') : 'File loaded'}
               </div>
             )}
           </div>
