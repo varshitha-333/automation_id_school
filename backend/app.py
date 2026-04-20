@@ -188,14 +188,23 @@ def get_schools():
 
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
+    print(f"DEBUG: Upload endpoint called")
     if "file" not in request.files:
+        print(f"DEBUG: No file in request")
         return jsonify({"error": "No file"}), 400
     f = request.files["file"]
+    print(f"DEBUG: File received: {f.filename}")
     try:
-        students = parse_file(f.read(), f.filename)
+        file_content = f.read()
+        print(f"DEBUG: File size: {len(file_content)} bytes")
+        students = parse_file(file_content, f.filename)
+        print(f"DEBUG: Parsed {len(students)} students")
+        if students:
+            print(f"DEBUG: First student: {students[0]}")
         _store["students"] = students
         _store["source"] = "file"
         _store["school_name"] = "Uploaded File"
+        print(f"DEBUG: Students stored in _store")
         return jsonify({
             "success": True,
             "count": len(students),
@@ -203,6 +212,7 @@ def upload_file():
             "session": students[0].get("session", DEFAULT_SESSION) if students else DEFAULT_SESSION,
         })
     except Exception as e:
+        print(f"DEBUG: Upload error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/fetch-school/<int:school_id>", methods=["GET"])
@@ -653,8 +663,12 @@ def build_pdf_bytes(students, dpi=600):
 
 @app.route("/api/preview/all", methods=["GET"])
 def preview_all():
+    print(f"DEBUG: Preview all endpoint called")
     students = _store["students"]
-    if not students: return jsonify({"error":"No students loaded"}),400
+    if not students: 
+        print(f"DEBUG: No students in store")
+        return jsonify({"error":"No students loaded"}),400
+    print(f"DEBUG: Found {len(students)} students for preview")
     cls = request.args.get("class","").strip().upper()
     if cls: students = [s for s in students if s.get("class","").strip().upper()==cls]
     dpi = 300
@@ -665,8 +679,12 @@ def preview_all():
 
 @app.route("/api/download/all", methods=["GET"])
 def download_all():
+    print(f"DEBUG: Download all endpoint called")
     students = _store["students"]
-    if not students: return jsonify({"error":"No students loaded"}),400
+    if not students: 
+        print(f"DEBUG: No students in store for download")
+        return jsonify({"error":"No students loaded"}),400
+    print(f"DEBUG: Found {len(students)} students for download")
     cls = request.args.get("class","").strip().upper()
     if cls:
         students = [s for s in students if s.get("class","").strip().upper()==cls]
