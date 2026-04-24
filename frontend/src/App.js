@@ -44,7 +44,7 @@ const FALLBACK_TEMPLATES = [
     display_name: 'Hebron Mission School',
     description: 'Red layout — includes section, roll number, blood group and parent details.',
     fields: ['student_name', 'class', 'section', 'roll', 'father_name', 'mother_name', 'dob', 'address', 'mobile', 'adm_no', 'blood_group', 'session'],
-    preview_url: API_ORIGIN ? `${API_ORIGIN}/api/templates/hebron/preview.png` : null,
+    preview_url: '/api/templates/hebron/preview.png',
     color: '#DC2626',
   },
   {
@@ -53,7 +53,7 @@ const FALLBACK_TEMPLATES = [
     display_name: 'My Redeemer Mission School',
     description: 'Blue layout — includes student name, class, father name, DOB, mobile and address.',
     fields: ['student_name', 'class', 'father_name', 'dob', 'mobile', 'address', 'session'],
-    preview_url: API_ORIGIN ? `${API_ORIGIN}/api/templates/redeemer/preview.png` : null,
+    preview_url: '/api/templates/redeemer/preview.png',
     color: '#4F46E5',
   },
 ];
@@ -280,10 +280,14 @@ export default function App() {
     templates.find((t) => t.key === selectedTemplate) || templates[0] || FALLBACK_TEMPLATES[0],
     [templates, selectedTemplate]);
 
+  // Ref always holds latest template key — prevents stale closure in async PDF calls
+  const selectedTemplateRef = useRef(selectedTemplate);
+  useEffect(() => { selectedTemplateRef.current = selectedTemplate; }, [selectedTemplate]);
+
   const withTemplate = useCallback((baseUrl, extra = {}) => {
-    const params = new URLSearchParams({ ...extra, template: selectedTemplate });
+    const params = new URLSearchParams({ ...extra, template: selectedTemplateRef.current });
     return `${baseUrl}?${params.toString()}`;
-  }, [selectedTemplate]);
+  }, []);
 
   const totalClasses    = (status.classes || []).length;
   const classOptions    = (status.classes || []).map((c) => ({ value: c, label: `Class ${c}` }));
@@ -321,8 +325,8 @@ export default function App() {
         ...t,
         color: t.color || (t.key === 'hebron' ? '#DC2626' : '#4F46E5'),
         preview_url: t.preview_url
-          ? (t.preview_url.startsWith('http') ? t.preview_url : `${API_ORIGIN}${t.preview_url}`)
-          : null,
+          ? (t.preview_url.startsWith('http') ? t.preview_url : t.preview_url.startsWith('/') ? t.preview_url : `/${t.preview_url}`)
+          : `/api/templates/${t.key}/preview.png`,
       }));
       setTemplates(list);
       setSelectedTemplate((prev) => list.some((t) => t.key === prev) ? prev : list[0]?.key || 'redeemer');
