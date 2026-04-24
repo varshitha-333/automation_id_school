@@ -280,8 +280,13 @@ export default function App() {
     templates.find((t) => t.key === selectedTemplate) || templates[0] || FALLBACK_TEMPLATES[0],
     [templates, selectedTemplate]);
 
+  useEffect(() => {
+    console.log('[DEBUG] selectedTemplate state changed =>', selectedTemplate);
+  }, [selectedTemplate]);
+
   const withTemplate = useCallback((baseUrl, extra = {}) => {
     const params = new URLSearchParams({ ...extra, template: selectedTemplate });
+    console.log('[DEBUG] withTemplate called | selectedTemplate =', selectedTemplate, '| url =', `${baseUrl}?${params.toString()}`);
     return `${baseUrl}?${params.toString()}`;
   }, [selectedTemplate]);
 
@@ -383,29 +388,37 @@ export default function App() {
 
   const downloadPDF = async (cls = null) => {
     const key = cls ? `${cls}_dl` : 'all_dl';
+    console.log('[DEBUG] downloadPDF clicked | cls =', cls, '| selectedTemplate STATE =', selectedTemplate);
     setCardLoading(key);
     try {
       const url = cls ? withTemplate(`${API}/download/all`, { class: cls }) : withTemplate(`${API}/download/all`);
+      console.log('[DEBUG] downloadPDF | final URL =', url);
       const resp = await axios.get(url, { responseType: 'blob' });
+      console.log('[DEBUG] downloadPDF | response status =', resp.status, '| content-type =', resp.headers['content-type'], '| content-disposition =', resp.headers['content-disposition']);
       const result = await openExternalOrBlob(resp, cls ? `ids_${selectedTemplate}_${cls}.pdf` : `ids_${selectedTemplate}_ALL.pdf`);
       registerDone();
       addToast(result.external ? 'PDF opened from cloud storage' : 'PDF downloaded', 'success');
     } catch (err) {
+      console.error('[DEBUG] downloadPDF ERROR:', err?.response?.status, err?.response?.data, err?.message);
       addToast(err.response?.data?.error || 'Download failed', 'error');
     } finally { setCardLoading(null); }
   };
 
   const viewPDF = async (cls = null) => {
     const key = cls ? `${cls}_view` : 'all_view';
+    console.log('[DEBUG] viewPDF clicked | cls =', cls, '| selectedTemplate STATE =', selectedTemplate);
     setCardLoading(key);
     try {
       const url = cls ? withTemplate(`${API}/preview/all`, { class: cls }) : withTemplate(`${API}/preview/all`);
+      console.log('[DEBUG] viewPDF | final URL =', url);
       const resp = await axios.get(url, { responseType: 'blob' });
+      console.log('[DEBUG] viewPDF | response status =', resp.status, '| content-type =', resp.headers['content-type']);
       await openExternalOrBlob(resp, 'preview.pdf', (u, ext) => {
         setModal({ url: u, title: cls ? `Class ${cls} — Preview` : 'All Students — Preview', external: ext });
       });
       registerDone();
     } catch (err) {
+      console.error('[DEBUG] viewPDF ERROR:', err?.response?.status, err?.message);
       addToast(err.response?.data?.error || 'Preview failed', 'error');
     } finally { setCardLoading(null); }
   };
@@ -441,6 +454,7 @@ export default function App() {
   };
 
   const confirmTemplate = () => {
+    console.log('[DEBUG] confirmTemplate | selectedTemplate =', selectedTemplate, '| activeTemplate =', activeTemplate?.key, activeTemplate?.label);
     setTemplateConfirmed(true);
     setActiveStep(1);
     addToast(`Template set: ${activeTemplate?.label}`, 'success');
