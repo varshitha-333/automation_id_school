@@ -53,9 +53,23 @@ CORS(app,
      origins=["*"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
-     supports_credentials=True,
+     supports_credentials=False,
      expose_headers=["Content-Disposition", "Content-Type"])
-     
+
+@app.after_request
+def _add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"]   = "*"
+    response.headers["Access-Control-Allow-Methods"]  = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"]  = "Content-Type, Authorization, X-Requested-With"
+    response.headers["Access-Control-Expose-Headers"] = "Content-Disposition, Content-Type"
+    return response
+
+@app.route("/api/<path:subpath>", methods=["OPTIONS"])
+@app.route("/<path:subpath>", methods=["OPTIONS"])
+def options_handler(subpath=""):
+    return ("", 204)
+
+
 
 BASE_DIR               = Path(__file__).parent
 TEMPLATE_PDF_HEBRON    = BASE_DIR / "template_id_card.pdf"
@@ -2105,8 +2119,11 @@ def download_student():
                               template_key=template_key)
 
 # ─────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    ck = '\u2713'; xk = '\u2717'
+# ─────────────────────────────────────────────────────────────────
+# Startup log — runs under both gunicorn and python app.py
+# ─────────────────────────────────────────────────────────────────
+def _print_startup():
+    ck = chr(0x2713); xk = chr(0x2717)
     print("=" * 60)
     print("  ID Card Generator Backend  v2.1  (vector-native, optimized)")
     print(f"  Hebron PDF   : {ck+' found' if TEMPLATE_PDF_HEBRON.exists() else xk+' NOT FOUND (raster fallback)'}")
@@ -2115,14 +2132,14 @@ if __name__ == "__main__":
     print(f"  Arial Bold   : {ck+' found' if ARIAL_BOLD.exists() else xk+' NOT FOUND'}")
     print(f"  PyMuPDF      : {ck if HAS_FITZ else xk+' pip install pymupdf'}")
     print(f"  Pillow       : {ck if HAS_PIL  else xk+' pip install pillow'}")
-    print(f"  Photo size   : {PHOTO_PX}×{PHOTO_PX} px  JPEG quality {PHOTO_JPEG_QUALITY}")
-    print(f"  Photo cache  : LRU({MAX_CACHED_PHOTOS}) entries  ≈ {MAX_CACHED_PHOTOS*80//1024} MB max")
-    print(f"  Save batch   : {SAVE_BATCH_PAGES} pages per flush")
+    print(f"  Photo size   : {PHOTO_PX}x{PHOTO_PX} px  JPEG quality {PHOTO_JPEG_QUALITY}")
+    print(f"  Photo cache  : LRU({MAX_CACHED_PHOTOS}) entries")
     print(f"  Prefetch     : {PREFETCH_WORKERS} threads")
     print(f"  Storage      : {STORAGE_BACKEND}")
     print("=" * 60)
 
-    port  = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG","").strip() == "1"
+_print_startup()   # always runs — gunicorn imports this module at startup
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host="0.0.0.0", port=port)
