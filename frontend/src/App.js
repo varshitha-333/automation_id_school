@@ -44,7 +44,7 @@ const FALLBACK_TEMPLATES = [
     display_name: 'Hebron Mission School',
     description: 'Red layout — includes section, roll number, blood group and parent details.',
     fields: ['student_name', 'class', 'section', 'roll', 'father_name', 'mother_name', 'dob', 'address', 'mobile', 'adm_no', 'blood_group', 'session'],
-    preview_url: '/api/templates/hebron/preview.png',
+    preview_url: `${API_ORIGIN}/api/templates/hebron/preview.png`,
     color: '#DC2626',
   },
   {
@@ -284,11 +284,11 @@ export default function App() {
   const selectedTemplateRef = useRef(selectedTemplate);
   useEffect(() => { selectedTemplateRef.current = selectedTemplate; }, [selectedTemplate]);
 
-  const withTemplate = useCallback((baseUrl, extra = {}) => {
-    const params = new URLSearchParams({ ...extra, template: selectedTemplateRef.current });
-    return `${baseUrl}?${params.toString()}`;
-  }, []);
-
+  // Replace the withTemplate helper (line 287-290):
+const withTemplate = useCallback((baseUrl, extra = {}) => {
+  const params = new URLSearchParams({ ...extra, template: selectedTemplate }); // use state, not ref
+  return `${baseUrl}?${params.toString()}`;
+}, [selectedTemplate]); // add selectedTemplate as dependency
   const totalClasses    = (status.classes || []).length;
   const classOptions    = (status.classes || []).map((c) => ({ value: c, label: `Class ${c}` }));
   const filteredClasses = useMemo(() => {
@@ -325,8 +325,11 @@ export default function App() {
         ...t,
         color: t.color || (t.key === 'hebron' ? '#DC2626' : '#4F46E5'),
         preview_url: t.preview_url
-          ? (t.preview_url.startsWith('http') ? t.preview_url : t.preview_url.startsWith('/') ? t.preview_url : `/${t.preview_url}`)
-          : `/api/templates/${t.key}/preview.png`,
+  ? (t.preview_url.startsWith('http')
+      ? t.preview_url
+      : `${API_ORIGIN}${t.preview_url.startsWith('/') ? '' : '/'}${t.preview_url}`)
+  : `${API_ORIGIN}/api/templates/${t.key}/preview.png`,
+
       }));
       setTemplates(list);
       setSelectedTemplate((prev) => list.some((t) => t.key === prev) ? prev : list[0]?.key || 'redeemer');
