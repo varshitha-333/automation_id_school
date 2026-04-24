@@ -40,6 +40,7 @@ const normalizeApiBase = (rawValue) => {
 };
 
 const API = normalizeApiBase(process.env.REACT_APP_API_URL || '/api');
+const API_ORIGIN = (process.env.REACT_APP_API_URL || '').replace(/\/+$/, '');
 
 const FALLBACK_TEMPLATES = [
   {
@@ -48,7 +49,7 @@ const FALLBACK_TEMPLATES = [
     display_name: 'Hebron Mission School',
     description: 'Red layout with section, roll, blood group and parent details.',
     fields: ['student_name', 'class', 'section', 'roll', 'father_name', 'mother_name', 'dob', 'address', 'mobile', 'adm_no', 'blood_group', 'session'],
-    preview_url: '/api/templates/hebron/preview.png',
+    preview_url: `${API_ORIGIN}/api/templates/hebron/preview.png`,
   },
   {
     key: 'redeemer',
@@ -56,7 +57,7 @@ const FALLBACK_TEMPLATES = [
     display_name: 'My Redeemer Mission School',
     description: 'Blue layout with student name, class, father name, DOB, mobile and address.',
     fields: ['student_name', 'class', 'father_name', 'dob', 'mobile', 'address', 'session'],
-    preview_url: '/api/templates/redeemer/preview.png',
+    preview_url: `${API_ORIGIN}/api/templates/redeemer/preview.png`,
   },
 ];
 
@@ -400,17 +401,26 @@ export default function App() {
 
     setLoadingTemplates(true);
     axios.get(`${API}/templates`).then((response) => {
-      const list = Array.isArray(response.data) && response.data.length ? response.data : FALLBACK_TEMPLATES;
+      const raw = Array.isArray(response.data) && response.data.length ? response.data : FALLBACK_TEMPLATES;
+      const list = raw.map((t) => ({
+        ...t,
+        preview_url: t.preview_url?.startsWith('http')
+          ? t.preview_url
+          : `${API_ORIGIN}${t.preview_url}`,
+      }));
       setTemplates(list);
-      if (!list.some((template) => template.key === selectedTemplate)) {
-        setSelectedTemplate(list[0]?.key || 'hebron');
-      }
+      setSelectedTemplate((prev) => {
+        if (!list.some((template) => template.key === prev)) {
+          return list[0]?.key || 'hebron';
+        }
+        return prev;
+      });
     }).catch(() => {
       setTemplates(FALLBACK_TEMPLATES);
     }).finally(() => {
       setLoadingTemplates(false);
     });
-  }, [refreshStatus, selectedTemplate]);
+  }, [refreshStatus]);
 
   useEffect(() => {
     const node = stepRefs.current[activeStep];

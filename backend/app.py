@@ -55,6 +55,7 @@ CORS(app,
      allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
      supports_credentials=True,
      expose_headers=["Content-Disposition", "Content-Type"])
+     
 
 BASE_DIR               = Path(__file__).parent
 TEMPLATE_PDF_HEBRON    = BASE_DIR / "template_id_card.pdf"
@@ -2123,4 +2124,5 @@ if __name__ == "__main__":
 
     port  = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG","").strip() == "1"
-    app.run(debug=debug, use_reloader=debug, host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
