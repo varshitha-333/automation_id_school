@@ -280,10 +280,6 @@ export default function App() {
     templates.find((t) => t.key === selectedTemplate) || templates[0] || FALLBACK_TEMPLATES[0],
     [templates, selectedTemplate]);
 
-  // Ref always holds latest template key — prevents stale closure in async PDF calls
-  const selectedTemplateRef = useRef(selectedTemplate);
-  useEffect(() => { selectedTemplateRef.current = selectedTemplate; }, [selectedTemplate]);
-
   const withTemplate = useCallback((baseUrl, extra = {}) => {
     const params = new URLSearchParams({ ...extra, template: selectedTemplate });
     return `${baseUrl}?${params.toString()}`;

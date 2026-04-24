@@ -53,11 +53,12 @@ CORS(app,
      origins=["*"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
-     supports_credentials=False,
+     supports_credentials=False,  # cannot be True when origins=["*"] — browsers block it
      expose_headers=["Content-Disposition", "Content-Type"])
 
 @app.after_request
-def _add_cors_headers(response):
+def _add_cors(response):
+    """Stamp CORS headers on EVERY response — including Flask error pages flask-cors can miss."""
     response.headers["Access-Control-Allow-Origin"]   = "*"
     response.headers["Access-Control-Allow-Methods"]  = "GET, POST, PUT, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"]  = "Content-Type, Authorization, X-Requested-With"
@@ -66,9 +67,9 @@ def _add_cors_headers(response):
 
 @app.route("/api/<path:subpath>", methods=["OPTIONS"])
 @app.route("/<path:subpath>", methods=["OPTIONS"])
-def options_handler(subpath=""):
+def _options_handler(subpath=""):
+    """Handle preflight OPTIONS so gunicorn/nginx never drops them."""
     return ("", 204)
-
 
 
 BASE_DIR               = Path(__file__).parent
@@ -79,7 +80,7 @@ ARIAL_BOLD             = BASE_DIR / "arialbd.ttf"
 FALLBACK_PHOTO         = BASE_DIR / "student_photo.jpg"
 
 DEFAULT_SESSION = "2026-27"
-DEFAULT_TEMPLATE = "hebron"
+DEFAULT_TEMPLATE = "redeemer"  # changed: "hebron" was silently used when ?template param was missing
 
 # ── School registry ───────────────────────────────────────────────
 SCHOOLS = {
@@ -2119,26 +2120,23 @@ def download_student():
                               template_key=template_key)
 
 # ─────────────────────────────────────────────────────────────────
+# Startup diagnostics — runs at module import (works with gunicorn too)
 # ─────────────────────────────────────────────────────────────────
-# Startup log — runs under both gunicorn and python app.py
-# ─────────────────────────────────────────────────────────────────
-def _print_startup():
+def _startup_log():
     ck = chr(0x2713); xk = chr(0x2717)
-    print("=" * 60)
-    print("  ID Card Generator Backend  v2.1  (vector-native, optimized)")
-    print(f"  Hebron PDF   : {ck+' found' if TEMPLATE_PDF_HEBRON.exists() else xk+' NOT FOUND (raster fallback)'}")
-    print(f"  Redeemer PDF : {ck+' found' if TEMPLATE_PDF_REDEEMER.exists() else xk+' NOT FOUND (raster fallback)'}")
-    print(f"  Anton font   : {ck+' found' if ANTON_FONT.exists() else xk+' NOT FOUND'}")
-    print(f"  Arial Bold   : {ck+' found' if ARIAL_BOLD.exists() else xk+' NOT FOUND'}")
-    print(f"  PyMuPDF      : {ck if HAS_FITZ else xk+' pip install pymupdf'}")
-    print(f"  Pillow       : {ck if HAS_PIL  else xk+' pip install pillow'}")
-    print(f"  Photo size   : {PHOTO_PX}x{PHOTO_PX} px  JPEG quality {PHOTO_JPEG_QUALITY}")
-    print(f"  Photo cache  : LRU({MAX_CACHED_PHOTOS}) entries")
-    print(f"  Prefetch     : {PREFETCH_WORKERS} threads")
-    print(f"  Storage      : {STORAGE_BACKEND}")
-    print("=" * 60)
+    print("=" * 62)
+    print("  ID Card Generator  v2.1  (vector-native, gunicorn-ready)")
+    print(f"  Hebron PDF    : {ck+' found' if TEMPLATE_PDF_HEBRON.exists() else xk+' NOT FOUND — raster fallback'}")
+    print(f"  Redeemer PDF  : {ck+' found' if TEMPLATE_PDF_REDEEMER.exists() else xk+' NOT FOUND — raster fallback'}")
+    print(f"  Anton font    : {ck+' found' if ANTON_FONT.exists() else xk+' NOT FOUND'}")
+    print(f"  Arial Bold    : {ck+' found' if ARIAL_BOLD.exists() else xk+' NOT FOUND'}")
+    print(f"  PyMuPDF       : {ck if HAS_FITZ else xk+' pip install pymupdf'}")
+    print(f"  Pillow        : {ck if HAS_PIL  else xk+' pip install pillow'}")
+    print(f"  Default tmpl  : {DEFAULT_TEMPLATE}")
+    print(f"  Storage       : {STORAGE_BACKEND}")
+    print("=" * 62)
 
-_print_startup()   # always runs — gunicorn imports this module at startup
+_startup_log()  # runs on every gunicorn worker import, not just __main__
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
