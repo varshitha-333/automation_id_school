@@ -56,13 +56,15 @@ CORS(app,
      supports_credentials=True,
      expose_headers=["Content-Disposition", "Content-Type"])
 
-BASE_DIR       = Path(__file__).parent
-TEMPLATE_PDF   = BASE_DIR / "template_id_card.pdf"
-ANTON_FONT     = BASE_DIR / "Anton-Regular.ttf"
-ARIAL_BOLD     = BASE_DIR / "arialbd.ttf"
-FALLBACK_PHOTO = BASE_DIR / "student_photo.jpg"
+BASE_DIR               = Path(__file__).parent
+TEMPLATE_PDF_HEBRON    = BASE_DIR / "template_id_card.pdf"
+TEMPLATE_PDF_REDEEMER  = BASE_DIR / "template_redeemer.pdf"
+ANTON_FONT             = BASE_DIR / "Anton-Regular.ttf"
+ARIAL_BOLD             = BASE_DIR / "arialbd.ttf"
+FALLBACK_PHOTO         = BASE_DIR / "student_photo.jpg"
 
 DEFAULT_SESSION = "2026-27"
+DEFAULT_TEMPLATE = "hebron"
 
 # ── School registry ───────────────────────────────────────────────
 SCHOOLS = {
@@ -70,6 +72,32 @@ SCHOOLS = {
     3: "Hebron Mission School",
     4: "Priyanka Dreamnest School",
     5: "Ab Ascent School",
+}
+
+TEMPLATE_CONFIGS = {
+    "hebron": {
+        "key": "hebron",
+        "label": "Hebron",
+        "display_name": "Hebron Mission School",
+        "pdf": TEMPLATE_PDF_HEBRON,
+        "description": "Red Hebron layout with section, roll, mother name and blood group.",
+        "fields": [
+            "student_name", "class", "section", "roll", "father_name",
+            "mother_name", "dob", "address", "mobile", "adm_no",
+            "blood_group", "session", "photo_url",
+        ],
+    },
+    "redeemer": {
+        "key": "redeemer",
+        "label": "Redeemer",
+        "display_name": "My Redeemer Mission School",
+        "pdf": TEMPLATE_PDF_REDEEMER,
+        "description": "Blue Redeemer layout with father name, DOB, mobile and address.",
+        "fields": [
+            "student_name", "class", "father_name", "dob", "address",
+            "mobile", "session", "photo_url", "adm_no",
+        ],
+    },
 }
 
 API_BASE_URL = "https://titusattendence.com/apikey/apistudents?school_id={school_id}"
@@ -90,7 +118,7 @@ MAX_UPLOAD_MB             = int(os.environ.get("MAX_UPLOAD_MB", "12"))
 MAX_STUDENTS_PER_REQUEST  = int(os.environ.get("MAX_STUDENTS_PER_REQUEST", "1000"))
 PREVIEW_DPI               = int(os.environ.get("PREVIEW_DPI", "150"))   # only for raster fallback
 DOWNLOAD_DPI              = int(os.environ.get("DOWNLOAD_DPI", "150"))  # only for raster fallback
-PHOTO_TIMEOUT             = (4, 10)
+PHOTO_TIMEOUT             = (3, 6)   # FIX v2.2: fail fast — was (4,10), 10s×30 imgs=300s blocked
 MAX_PHOTO_BYTES           = int(os.environ.get("MAX_PHOTO_BYTES", str(3 * 1024 * 1024)))
 PDF_TEMP_DIR              = os.environ.get("PDF_TEMP_DIR", tempfile.gettempdir())
 
@@ -99,9 +127,11 @@ PHOTO_PX           = int(os.environ.get("PHOTO_PX", "300"))
 PHOTO_JPEG_QUALITY = int(os.environ.get("PHOTO_JPEG_QUALITY", "80"))
 
 # ── Optimization tuning ───────────────────────────────────────────
-MAX_CACHED_PHOTOS  = int(os.environ.get("MAX_CACHED_PHOTOS", "200"))   # LRU cap
-SAVE_BATCH_PAGES   = int(os.environ.get("SAVE_BATCH_PAGES", "10"))     # pages per flush
-PREFETCH_WORKERS   = int(os.environ.get("PREFETCH_WORKERS", "4"))      # photo threads
+MAX_CACHED_PHOTOS  = int(os.environ.get("MAX_CACHED_PHOTOS", "200"))   # safer default for 512 MB instances
+SAVE_BATCH_PAGES   = int(os.environ.get("SAVE_BATCH_PAGES", "10"))     # kept for env-compat (no longer used in hot path)
+PREFETCH_WORKERS   = int(os.environ.get("PREFETCH_WORKERS", "4"))      # I/O overlap without oversubscribing 0.1 CPU instances
+PREVIEW_EXTERNAL_THRESHOLD = int(os.environ.get("PREVIEW_EXTERNAL_THRESHOLD", "9999"))  # FIX v2.2: disable external-on-preview — it caused 500s at 70+ students when no storage backend configured
+REDEEMER_GRAD_STEPS = int(os.environ.get("REDEEMER_GRAD_STEPS", "90"))
 
 # ── External storage ──────────────────────────────────────────────
 STORAGE_BACKEND           = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
@@ -319,7 +349,7 @@ def parse_file(file_path, filename):
             "address":      pick(rm,"address","student_address","residence"),
             "mobile":       pick(rm,"mobile","phone","mobile_no","contact","father_contact"),
             "photo_url":    pick(rm,"photo_url","photo","image_url","photo_link","student_photo"),
-            "adm_no":       pick(rm,"adm_no","admission_no","admission_number","adm","admno"),
+            "adm_no":       pick(rm,"adm_no","admission_no","admission_number","adm","admno","reg_no","registration_no"),
             "blood_group":  pick(rm,"blood_group","bloodgroup","blood"),
             "gender":       pick(rm,"gender","sex"),
             "session":      pick(rm,"session",default=DEFAULT_SESSION),
@@ -339,7 +369,7 @@ _API_MAP = {
     "mother":"mother_name","date_of_birth":"dob","student_address":"address",
     "mobile":"mobile","phone":"mobile","mobile_no":"mobile","contact":"mobile",
     "photo_url":"photo_url","photo":"photo_url","adm_no":"adm_no",
-    "admission_number":"adm_no","adm":"adm_no","bloodgroup":"blood_group",
+    "admission_number":"adm_no","adm":"adm_no","reg_no":"adm_no","registration_no":"adm_no","bloodgroup":"blood_group",
     "blood":"blood_group","gender":"gender","sex":"gender",
 }
 
@@ -486,6 +516,15 @@ def _classes_summary(students):
         cc[s.get("class","").strip().upper()] += 1
     return [{"class": k, "count": v} for k, v in sorted(cc.items(), key=lambda x: class_sort_key(x[0]))]
 
+
+def normalize_template_key(value):
+    key = str(value or DEFAULT_TEMPLATE).strip().lower()
+    return key if key in TEMPLATE_CONFIGS else DEFAULT_TEMPLATE
+
+
+def get_template_config(template_key=None):
+    return TEMPLATE_CONFIGS[normalize_template_key(template_key)]
+
 # ─────────────────────────────────────────────────────────────────
 # PHOTO CACHE — LRU-bounded, thread-safe
 # OPT-1: Replaces the original unbounded plain dict.
@@ -540,8 +579,12 @@ _photo_cache = _BoundedPhotoCache(maxsize=MAX_CACHED_PHOTOS)
 # Original: fitz.Font(...) called per card = 500 × 2 font objects created.
 # ─────────────────────────────────────────────────────────────────
 
-_template_bytes: bytes | None = None
-_template_lock  = threading.Lock()
+_template_bytes_cache: dict[str, bytes] = {}
+_template_locks = {key: threading.Lock() for key in TEMPLATE_CONFIGS}
+_template_doc_cache: dict[str, "fitz.Document"] = {}
+_template_doc_locks = {key: threading.Lock() for key in TEMPLATE_CONFIGS}
+_template_preview_cache: dict[str, bytes] = {}
+_template_preview_locks = {key: threading.Lock() for key in TEMPLATE_CONFIGS}
 
 _anton_font_obj = None
 _bold_font_obj  = None
@@ -549,20 +592,65 @@ _font_init_done = False
 _font_lock      = threading.Lock()
 
 
-def _ensure_template() -> bytes | None:
-    """Load template PDF bytes from disk once; return from RAM on every subsequent call."""
-    global _template_bytes
-    if _template_bytes is not None:
-        return _template_bytes
-    with _template_lock:
-        if _template_bytes is not None:
-            return _template_bytes
-        if not TEMPLATE_PDF.exists():
+def _ensure_template(template_key: str = DEFAULT_TEMPLATE) -> bytes | None:
+    """Load a template PDF into RAM once and reuse its bytes on every render."""
+    template = get_template_config(template_key)
+    key = template["key"]
+    if key in _template_bytes_cache:
+        return _template_bytes_cache[key]
+    lock = _template_locks[key]
+    with lock:
+        if key in _template_bytes_cache:
+            return _template_bytes_cache[key]
+        pdf_path = template["pdf"]
+        if not pdf_path.exists():
             return None
-        with open(str(TEMPLATE_PDF), "rb") as fh:
-            _template_bytes = fh.read()
-        print(f"DEBUG: template loaded into RAM ({len(_template_bytes) // 1024} KB)")
-        return _template_bytes
+        with open(str(pdf_path), "rb") as fh:
+            _template_bytes_cache[key] = fh.read()
+        print(f"DEBUG: template {key} loaded into RAM ({len(_template_bytes_cache[key]) // 1024} KB)")
+        return _template_bytes_cache[key]
+
+
+def _get_template_doc(template_key: str = DEFAULT_TEMPLATE) -> "fitz.Document | None":
+    """Open a shared template PDF document once and reuse it for show_pdf_page()."""
+    if not HAS_FITZ:
+        return None
+    key = normalize_template_key(template_key)
+    if key in _template_doc_cache:
+        return _template_doc_cache[key]
+    lock = _template_doc_locks[key]
+    with lock:
+        if key in _template_doc_cache:
+            return _template_doc_cache[key]
+        tmpl_bytes = _ensure_template(key)
+        if tmpl_bytes is None:
+            return None
+        _template_doc_cache[key] = fitz.open("pdf", tmpl_bytes)
+        print(f"DEBUG: template doc {key} opened once for shared placement")
+        return _template_doc_cache[key]
+
+
+def _get_template_preview_png(template_key: str = DEFAULT_TEMPLATE) -> bytes | None:
+    key = normalize_template_key(template_key)
+    if key in _template_preview_cache:
+        return _template_preview_cache[key]
+    if not HAS_FITZ:
+        return None
+    lock = _template_preview_locks[key]
+    with lock:
+        if key in _template_preview_cache:
+            return _template_preview_cache[key]
+        tmpl_bytes = _ensure_template(key)
+        if tmpl_bytes is None:
+            return None
+        doc = fitz.open("pdf", tmpl_bytes)
+        try:
+            page = doc[0]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            _template_preview_cache[key] = pix.tobytes("png")
+        finally:
+            doc.close()
+        return _template_preview_cache[key]
 
 
 def _ensure_fonts():
@@ -780,6 +868,49 @@ ADM_FONT_SIZE    = 6.5;  SESSION_FONT_SIZE = 7.5; BLOOD_FONT_SIZE = 6.88
 ADDR_MAX_LINES   = 3;    ADDR_LINE_GAP    = 1.10; ADDR_MIN_SIZE   = 3.5
 ADDR_SIZE_STEPS  = [5.5, 5.2, 5.0, 4.8, 4.5, 4.2, 4.0, 3.8, 3.5]
 
+REDEEMER_BG_COLOR               = (0.9529, 0.9922, 1.0)
+REDEEMER_GRAD_LEFT             = (234/255, 250/255, 255/255)
+REDEEMER_GRAD_RIGHT            = (245/255, 253/255, 255/255)
+REDEEMER_BLUE                  = (31/255, 72/255, 255/255)
+REDEEMER_RED                   = (1.0, 0.1922, 0.1922)
+REDEEMER_WHITE                 = (232/255, 246/255, 255/255)
+REDEEMER_BLACK                 = (0.0, 0.0, 0.0)
+REDEEMER_PHOTO_OUTER_RECT      = (53.55, 75.973, 99.45, 132.989)
+REDEEMER_PHOTO_RECT_COORDS     = (54.58, 77.072, 98.594, 131.969)
+REDEEMER_PHOTO_BORDER_W        = 1.03
+REDEEMER_BANNER_RECT           = (0.0, 140.0, 126.0, 163.94)
+REDEEMER_BANNER_TEXT_LEFT      = 4.0
+REDEEMER_BANNER_TEXT_RIGHT     = 126.0
+REDEEMER_BANNER_CENTER_X       = 63.0
+REDEEMER_BANNER_ACCENT_POINTS  = (
+    (126.0, 140.0),
+    (151.4, 140.0),
+    (142.0, 163.94),
+    (122.8, 163.94),
+)
+REDEEMER_NAME_TEXT_RECT        = (4.0, 142.0, 126.0, 153.8)
+REDEEMER_CLASS_TEXT_RECT       = (8.0, 154.0, 126.0, 163.2)
+REDEEMER_NAME_BASELINE_Y       = 150.032
+REDEEMER_CLASS_BASELINE_Y      = 161.681
+REDEEMER_SESSION_CLEAN_COORDS  = (103.0, 103.8, 137.6, 114.9)
+REDEEMER_SESSION_VALUE_RECT    = (106.8, 104.4, 136.0, 114.2)
+REDEEMER_DATA_CLEAN_RECT       = (63.0, 167.5, 153.0, 207.0)
+REDEEMER_VALUE_X               = 64.951
+REDEEMER_VALUE_MAX_X           = 149.0
+REDEEMER_FATHER_BASELINE_Y     = 175.50
+REDEEMER_DOB_BASELINE_Y        = 185.85
+REDEEMER_MOBILE_BASELINE_Y     = 196.20
+REDEEMER_ADDRESS_BASELINE_Y    = 206.55
+REDEEMER_NAME_FONT_SIZE        = 10.8775
+REDEEMER_NAME_MIN_SIZE         = 6.0
+REDEEMER_NAME_TRACKING         = 0.874
+REDEEMER_CLASS_FONT_SIZE       = 5.8842
+REDEEMER_CLASS_TRACKING        = 0.477
+REDEEMER_VALUE_FONT_SIZE       = 6.8
+REDEEMER_ADDRESS_MAX_LINES     = 2
+REDEEMER_ADDRESS_LINE_GAP      = 1.02
+REDEEMER_SESSION_FONT_SIZE     = 7.2
+
 TEARDROP_ITEMS = [
     ('l', (126.74588, 84.57169), (119.56597, 72.82723)),
     ('l', (119.56597, 72.82723), (112.91280, 84.49141)),
@@ -833,6 +964,345 @@ def draw_text_centered_hv(page, rect, text, fontfile, fontname, font_obj, size, 
         fontsize=size, color=color, overlay=True,
     )
 
+
+def clean_visible_text(text):
+    if text is None:
+        return ""
+    text = str(text)
+    text = (text
+            .replace("\xa0", " ")
+            .replace("\u200b", "")
+            .replace("\u200c", "")
+            .replace("\u200d", "")
+            .replace("\ufeff", "")
+            .replace("\ufffd", " "))
+    text = "".join(ch for ch in text if ch == "\n" or ord(ch) >= 32)
+    return " ".join(text.split()).strip()
+
+
+def clean_card_value(text):
+    text = clean_visible_text(text)
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in {"nan", "none", "null", "nil", "0000-00-00", "00-00-0000", "0000/00/00"}:
+        return ""
+    if all(ch in "0-/:. " for ch in text):
+        return ""
+    return text
+
+
+def prepare_photo_for_rect(photo_bytes, rect_coords, scale=6, output_format="PNG"):
+    if not HAS_PIL or not photo_bytes:
+        return photo_bytes
+    x0, y0, x1, y1 = rect_coords
+    target_w = max(1, int(round((x1 - x0) * scale)))
+    target_h = max(1, int(round((y1 - y0) * scale)))
+    target_ratio = (x1 - x0) / max(1e-6, (y1 - y0))
+    try:
+        with Image.open(io.BytesIO(photo_bytes)) as img:
+            rgb = img.convert("RGB")
+            src_w, src_h = rgb.size
+            src_ratio = src_w / max(1e-6, src_h)
+            if src_ratio > target_ratio:
+                new_w = max(1, int(round(src_h * target_ratio)))
+                left = max(0, (src_w - new_w) // 2)
+                rgb = rgb.crop((left, 0, left + new_w, src_h))
+            elif src_ratio < target_ratio:
+                new_h = max(1, int(round(src_w / target_ratio)))
+                top = max(0, (src_h - new_h) // 2)
+                rgb = rgb.crop((0, top, src_w, top + new_h))
+            resized = rgb.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            save_fmt = (output_format or "PNG").upper()
+            if save_fmt == "JPEG":
+                resized.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY, optimize=True, progressive=False)
+            else:
+                resized.save(buf, format="PNG")
+            resized.close()
+            if rgb is not img:
+                rgb.close()
+            return buf.getvalue()
+    except Exception:
+        return photo_bytes
+
+
+def insert_tracked_text(page, x, baseline_y, text, fontfile, fontname, font_obj, size, color, tracking=0.0):
+    text = clean_visible_text(text)
+    if not text:
+        return
+    if tracking <= 0 or len(text) <= 1:
+        page.insert_text(
+            (x, baseline_y), text,
+            fontname=fontname, fontfile=str(fontfile) if fontfile else None,
+            fontsize=size, color=color, overlay=True,
+        )
+        return
+    cursor = x
+    for ch in text:
+        page.insert_text(
+            (cursor, baseline_y), ch,
+            fontname=fontname, fontfile=str(fontfile) if fontfile else None,
+            fontsize=size, color=color, overlay=True,
+        )
+        cursor += font_obj.text_length(ch, fontsize=size) + tracking
+
+
+def draw_redeemer_banner_text(page, text, center_x, baseline_y, max_width, fontfile, fontname, font_obj, base_size, color, tracking=0.0, min_size=4.0):
+    text = clean_visible_text(text).upper()
+    if not text:
+        return
+    size, adjusted_tracking = _fit_tracked_text(font_obj, text, max_width, base_size, tracking, min_size=min_size)
+    text = _ellipsize_tracked_to_width(font_obj, text, max_width, size, adjusted_tracking)
+    if not text:
+        return
+    total_width = _tracked_text_width(font_obj, text, size, adjusted_tracking)
+    if total_width > max_width:
+        adjusted_tracking = 0.0
+        text = _ellipsize_tracked_to_width(font_obj, text, max_width, size, adjusted_tracking)
+        total_width = _tracked_text_width(font_obj, text, size, adjusted_tracking)
+    insert_tracked_text(
+        page,
+        center_x - total_width / 2.0,
+        baseline_y,
+        text,
+        fontfile,
+        fontname,
+        font_obj,
+        size,
+        color,
+        adjusted_tracking,
+    )
+
+
+def draw_redeemer_value(page, text, x, baseline_y, max_width, fontfile, fontname, font_obj, base_size, color, min_size=5.0):
+    value = clean_card_value(text)
+    if not value:
+        return
+    size = _fit_size(font_obj, value, max_width, base_size, min_size)
+    value = _ellipsize_to_width(font_obj, value, max_width, size)
+    if not value:
+        return
+    page.insert_text(
+        (x, baseline_y), value,
+        fontname=fontname, fontfile=str(fontfile) if fontfile else None,
+        fontsize=size, color=color, overlay=True,
+    )
+
+
+def render_redeemer_address(page, addr, x, baseline_y, max_width, fontfile, fontname, font_obj, color, base_size=6.8, min_size=4.8, max_lines=2, line_gap=1.03):
+    addr = clean_card_value(addr)
+    if not addr:
+        return
+    words = addr.split()
+    if not words:
+        return
+    for fs in [base_size, 6.5, 6.2, 6.0, 5.7, 5.4, 5.1, min_size]:
+        lines = _addr_wrap_at_size(font_obj, words, max_width, fs)
+        if len(lines) <= max_lines:
+            chosen_fs = fs
+            chosen_lines = lines
+            break
+    else:
+        chosen_fs = min_size
+        chosen_lines = _addr_wrap_at_size(font_obj, words, max_width, min_size)[:max_lines]
+        if chosen_lines:
+            last = chosen_lines[-1]
+            while last and font_obj.text_length(last + "…", fontsize=min_size) > max_width:
+                last = last[:-1]
+            chosen_lines[-1] = last.rstrip() + ("…" if last.rstrip() != addr else "")
+    step = chosen_fs * line_gap
+    for idx, line in enumerate(chosen_lines[:max_lines]):
+        page.insert_text(
+            (x, baseline_y + idx * step), line,
+            fontname=fontname, fontfile=str(fontfile) if fontfile else None,
+            fontsize=chosen_fs, color=color, overlay=True,
+        )
+
+
+def _tracked_text_width(font_obj, text, fontsize, tracking=0.0):
+    if not text:
+        return 0.0
+    base = font_obj.text_length(text, fontsize=fontsize)
+    if tracking <= 0 or len(text) <= 1:
+        return base
+    return base + tracking * (len(text) - 1)
+
+
+def _fit_tracked_text(font_obj, text, max_width, base_size, tracking=0.0, min_size=4.0):
+    size = base_size
+    adjusted_tracking = tracking
+    while size >= min_size:
+        if _tracked_text_width(font_obj, text, size, adjusted_tracking) <= max_width:
+            return size, adjusted_tracking
+        size -= 0.1
+        adjusted_tracking = tracking * (size / base_size) if base_size else tracking
+    return min_size, 0.0
+
+
+def _ellipsize_to_width(font_obj, text, max_width, fontsize):
+    text = clean_visible_text(text)
+    if not text:
+        return ""
+    if font_obj.text_length(text, fontsize=fontsize) <= max_width:
+        return text
+    ellipsis = "…"
+    if font_obj.text_length(ellipsis, fontsize=fontsize) > max_width:
+        return ""
+    trimmed = text.rstrip()
+    while trimmed and font_obj.text_length(trimmed + ellipsis, fontsize=fontsize) > max_width:
+        trimmed = trimmed[:-1].rstrip()
+    return (trimmed + ellipsis) if trimmed else ellipsis
+
+
+def _ellipsize_tracked_to_width(font_obj, text, max_width, fontsize, tracking=0.0):
+    text = clean_visible_text(text)
+    if not text:
+        return ""
+    if _tracked_text_width(font_obj, text, fontsize, tracking) <= max_width:
+        return text
+    ellipsis = "…"
+    if _tracked_text_width(font_obj, ellipsis, fontsize, 0.0) > max_width:
+        return ""
+    trimmed = text.rstrip()
+    while trimmed and _tracked_text_width(font_obj, trimmed + ellipsis, fontsize, tracking) > max_width:
+        trimmed = trimmed[:-1].rstrip()
+    return (trimmed + ellipsis) if trimmed else ellipsis
+
+
+def _draw_horizontal_gradient_mask(page, rect, left_color, right_color, steps):
+    steps = max(8, int(steps))
+    x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
+    band_w = (x1 - x0) / steps
+    for step in range(steps):
+        t = 0.0 if steps == 1 else step / (steps - 1)
+        color = (
+            left_color[0] + t * (right_color[0] - left_color[0]),
+            left_color[1] + t * (right_color[1] - left_color[1]),
+            left_color[2] + t * (right_color[2] - left_color[2]),
+        )
+        rx0 = x0 + step * band_w
+        rx1 = x0 + (step + 1) * band_w + 0.02
+        page.draw_rect(fitz.Rect(rx0, y0, rx1, y1), color=color, fill=color, width=0, overlay=True)
+
+
+def _draw_redeemer_overlay_core(page, student: dict, map_point, map_rect, scale_x=1.0, scale_y=1.0):
+    anton_obj, bold_obj, anton_fn, bold_fn, fn_anton, fn_bold = _ensure_fonts()
+    if anton_obj is None or bold_obj is None:
+        return
+
+    page.draw_rect(
+        map_rect(REDEEMER_BANNER_RECT),
+        color=REDEEMER_BLUE, fill=REDEEMER_BLUE, width=0, overlay=True,
+    )
+
+    page.draw_rect(
+        map_rect(REDEEMER_SESSION_CLEAN_COORDS),
+        color=REDEEMER_BG_COLOR, fill=REDEEMER_BG_COLOR, width=0, overlay=True,
+    )
+    _draw_horizontal_gradient_mask(
+        page,
+        map_rect(REDEEMER_DATA_CLEAN_RECT),
+        REDEEMER_GRAD_LEFT,
+        REDEEMER_GRAD_RIGHT,
+        max(20, REDEEMER_GRAD_STEPS),
+    )
+
+    page.draw_rect(
+        map_rect(REDEEMER_PHOTO_OUTER_RECT),
+        color=REDEEMER_WHITE, fill=REDEEMER_WHITE, width=0, overlay=True,
+    )
+    photo_bytes = prepare_photo_for_rect(fetch_photo_bytes(student.get("photo_url", "")), REDEEMER_PHOTO_RECT_COORDS)
+    if photo_bytes:
+        page.insert_image(
+            map_rect(REDEEMER_PHOTO_RECT_COORDS),
+            stream=photo_bytes,
+            overlay=True,
+            keep_proportion=False,
+        )
+    page.draw_rect(
+        map_rect(REDEEMER_PHOTO_OUTER_RECT),
+        color=REDEEMER_BLACK, fill=None, width=max(0.1, REDEEMER_PHOTO_BORDER_W * ((scale_x + scale_y) / 2.0)), overlay=True,
+    )
+
+    center_x = map_point(REDEEMER_BANNER_CENTER_X, 0).x
+    banner_max_width = max(1.0, (REDEEMER_BANNER_TEXT_RIGHT - REDEEMER_BANNER_TEXT_LEFT) * scale_x)
+    banner_min_scale = max(0.5, min(scale_x, scale_y))
+
+    draw_redeemer_banner_text(
+        page,
+        student.get("student_name", ""),
+        center_x,
+        map_point(0, REDEEMER_NAME_BASELINE_Y).y,
+        banner_max_width,
+        anton_fn, fn_anton, anton_obj,
+        REDEEMER_NAME_FONT_SIZE * banner_min_scale, REDEEMER_WHITE,
+        tracking=REDEEMER_NAME_TRACKING * scale_x,
+        min_size=REDEEMER_NAME_MIN_SIZE * banner_min_scale,
+    )
+
+    class_text = clean_card_value(student.get("class", "")).upper()
+    if class_text:
+        draw_redeemer_banner_text(
+            page,
+            f"CLASS:  {class_text}",
+            center_x,
+            map_point(0, REDEEMER_CLASS_BASELINE_Y).y,
+            banner_max_width,
+            bold_fn, fn_bold, bold_obj,
+            REDEEMER_CLASS_FONT_SIZE * banner_min_scale, REDEEMER_WHITE,
+            tracking=REDEEMER_CLASS_TRACKING * scale_x,
+            min_size=4.5 * banner_min_scale,
+        )
+
+    value_x = map_point(REDEEMER_VALUE_X, 0).x
+    value_max_width = max(1.0, (REDEEMER_VALUE_MAX_X - REDEEMER_VALUE_X) * scale_x)
+    value_base_size = REDEEMER_VALUE_FONT_SIZE * min(scale_x, scale_y)
+    value_min_size = 4.7 * min(scale_x, scale_y)
+
+    draw_redeemer_value(page, student.get("father_name", ""), value_x, map_point(0, REDEEMER_FATHER_BASELINE_Y).y, value_max_width, bold_fn, fn_bold, bold_obj, value_base_size, REDEEMER_BLACK, min_size=value_min_size)
+    draw_redeemer_value(page, student.get("dob", ""), value_x, map_point(0, REDEEMER_DOB_BASELINE_Y).y, value_max_width, bold_fn, fn_bold, bold_obj, value_base_size, REDEEMER_BLACK, min_size=value_min_size)
+    draw_redeemer_value(page, student.get("mobile", ""), value_x, map_point(0, REDEEMER_MOBILE_BASELINE_Y).y, value_max_width, bold_fn, fn_bold, bold_obj, value_base_size, REDEEMER_BLACK, min_size=value_min_size)
+    render_redeemer_address(page, student.get("address", ""), value_x, map_point(0, REDEEMER_ADDRESS_BASELINE_Y).y, value_max_width, bold_fn, fn_bold, bold_obj, REDEEMER_BLACK, base_size=value_base_size, min_size=4.6 * min(scale_x, scale_y), max_lines=REDEEMER_ADDRESS_MAX_LINES, line_gap=REDEEMER_ADDRESS_LINE_GAP)
+
+    session_value = clean_card_value(student.get("session", "")) or DEFAULT_SESSION
+    session_rect = map_rect(REDEEMER_SESSION_VALUE_RECT)
+    session_size = _fit_size(anton_obj, session_value, session_rect.width, REDEEMER_SESSION_FONT_SIZE * min(scale_x, scale_y), 5.6 * min(scale_x, scale_y))
+    session_value = _ellipsize_to_width(anton_obj, session_value, session_rect.width, session_size)
+    _put_single(page, session_rect, session_value, anton_fn, fn_anton, session_size, REDEEMER_BLACK, anton_obj)
+
+
+def draw_tracked_text_centered(page, rect, text, fontfile, fontname, font_obj, base_size, color, tracking=0.0):
+    text = clean_visible_text(text)
+    if not text:
+        return
+
+    size, adjusted_tracking = _fit_tracked_text(
+        font_obj, text, rect.width, base_size, tracking, min_size=3.8
+    )
+    total_width = _tracked_text_width(font_obj, text, size, adjusted_tracking)
+    glyph_height = size * (font_obj.ascender - font_obj.descender)
+    x = rect.x0 + (rect.width - total_width) / 2.0
+    y = rect.y0 + (rect.height + glyph_height) / 2.0 - size * abs(font_obj.descender)
+
+    if adjusted_tracking <= 0 or len(text) <= 1:
+        page.insert_text(
+            (x, y), text,
+            fontname=fontname, fontfile=str(fontfile) if fontfile else None,
+            fontsize=size, color=color, overlay=True,
+        )
+        return
+
+    cursor = x
+    for ch in text:
+        ch_width = font_obj.text_length(ch, fontsize=size)
+        page.insert_text(
+            (cursor, y), ch,
+            fontname=fontname, fontfile=str(fontfile) if fontfile else None,
+            fontsize=size, color=color, overlay=True,
+        )
+        cursor += ch_width + adjusted_tracking
+
 def _addr_wrap_at_size(font_obj, words, max_width, fs):
     lines = []; cur = ""
     for w in words:
@@ -854,11 +1324,11 @@ def _addr_wrap_at_size(font_obj, words, max_width, fs):
     if cur: lines.append(cur)
     return lines
 
-def render_address(page, rect, addr, fontfile, fontname, font_obj, color):
+def render_address(page, rect, addr, fontfile, fontname, font_obj, color, max_x=None):
     if not addr or addr.lower() in {"nan","none"}: return
     words = addr.split()
     if not words: return
-    max_w = SIGN_SAFE_X1 - rect.x0
+    max_w = (max_x if max_x is not None else rect.x1) - rect.x0
     chosen_fs = ADDR_MIN_SIZE; chosen_lines = []
     for fs in ADDR_SIZE_STEPS:
         lines  = _addr_wrap_at_size(font_obj, words, max_w, fs)
@@ -912,7 +1382,7 @@ def redraw_blood_teardrop(page, fill_color):
 # Net effect: no disk I/O and no font allocation in the hot render loop.
 # ─────────────────────────────────────────────────────────────────
 
-def render_card_pdf(student: dict) -> "fitz.Document | None":
+def render_card_pdf_hebron(student: dict) -> "fitz.Document | None":
     """
     Render a single student ID card as a fitz.Document (1 page).
     All text and shapes are vector. Only the photo is raster (JPEG ~60-80 KB).
@@ -923,7 +1393,7 @@ def render_card_pdf(student: dict) -> "fitz.Document | None":
         return None
 
     # OPT-2: template from RAM, not disk
-    tmpl_bytes = _ensure_template()
+    tmpl_bytes = _ensure_template("hebron")
     if tmpl_bytes is None:
         return None
 
@@ -1035,6 +1505,199 @@ def render_card_pdf(student: dict) -> "fitz.Document | None":
 
     return doc   # caller must close
 
+
+def render_card_pdf_redeemer(student: dict) -> "fitz.Document | None":
+    """Render a Redeemer card with the corrected single-card layout geometry."""
+    if not HAS_FITZ:
+        return None
+
+    tmpl_bytes = _ensure_template("redeemer")
+    if tmpl_bytes is None:
+        return None
+
+    doc = fitz.open("pdf", tmpl_bytes)
+    page = doc[0]
+
+    _draw_redeemer_overlay_core(
+        page,
+        student,
+        lambda x, y: fitz.Point(x, y),
+        lambda coords: fitz.Rect(*coords),
+        1.0,
+        1.0,
+    )
+    return doc
+
+
+def render_card_pdf(student: dict, template_key: str = DEFAULT_TEMPLATE) -> "fitz.Document | None":
+    template_key = normalize_template_key(template_key)
+    if template_key == "redeemer":
+        return render_card_pdf_redeemer(student)
+    return render_card_pdf_hebron(student)
+
+
+def _make_card_transform(source_rect, target_rect):
+    sx = target_rect.width / source_rect.width
+    sy = target_rect.height / source_rect.height
+    return {"src": source_rect, "dst": target_rect, "sx": sx, "sy": sy}
+
+
+def _tr_point(tr, x, y):
+    return fitz.Point(
+        tr["dst"].x0 + (x - tr["src"].x0) * tr["sx"],
+        tr["dst"].y0 + (y - tr["src"].y0) * tr["sy"],
+    )
+
+
+def _tr_rect(tr, coords):
+    x0, y0, x1, y1 = coords
+    p0 = _tr_point(tr, x0, y0)
+    p1 = _tr_point(tr, x1, y1)
+    return fitz.Rect(p0.x, p0.y, p1.x, p1.y)
+
+
+def _tr_font_size(tr, size):
+    return size * min(tr["sx"], tr["sy"])
+
+
+def _tr_line_width(tr, width):
+    return max(0.1, width * ((tr["sx"] + tr["sy"]) / 2.0))
+
+
+def redraw_blood_teardrop_transformed(page, tr, fill_color):
+    shape = page.new_shape()
+    p = lambda t: _tr_point(tr, *t)
+    shape.draw_line(p(TEARDROP_ITEMS[0][1]), p(TEARDROP_ITEMS[0][2]))
+    shape.draw_line(p(TEARDROP_ITEMS[1][1]), p(TEARDROP_ITEMS[1][2]))
+    shape.draw_bezier(p(TEARDROP_ITEMS[2][1]), p(TEARDROP_ITEMS[2][2]),
+                      p(TEARDROP_ITEMS[2][3]), p(TEARDROP_ITEMS[2][4]))
+    shape.draw_bezier(p(TEARDROP_ITEMS[3][1]), p(TEARDROP_ITEMS[3][2]),
+                      p(TEARDROP_ITEMS[3][3]), p(TEARDROP_ITEMS[3][4]))
+    shape.draw_bezier(p(TEARDROP_ITEMS[4][1]), p(TEARDROP_ITEMS[4][2]),
+                      p(TEARDROP_ITEMS[4][3]), p(TEARDROP_ITEMS[4][4]))
+    shape.finish(color=fill_color, fill=fill_color, width=0, closePath=True)
+    shape.commit(overlay=True)
+
+
+def draw_card_overlay_hebron(page, student: dict, tr):
+    anton_obj, bold_obj, anton_fn, bold_fn, fn_anton, fn_bold = _ensure_fonts()
+    if anton_obj is None or bold_obj is None:
+        return
+
+    shape = page.new_shape()
+    def band_right_x(y):
+        return -0.3952 * y + 172.6234
+    pts = [
+        _tr_point(tr, 0, BAND_Y0),
+        _tr_point(tr, band_right_x(BAND_Y0), BAND_Y0),
+        _tr_point(tr, band_right_x(BAND_Y1), BAND_Y1),
+        _tr_point(tr, 0, BAND_Y1),
+    ]
+    shape.draw_polyline(pts)
+    shape.draw_line(pts[-1], pts[0])
+    shape.finish(color=BANNER_RED, fill=BANNER_RED, width=0)
+    shape.commit(overlay=True)
+
+    for coords in [FATHER_CLEAN_COORDS, MOTHER_CLEAN_COORDS, DOB_CLEAN_COORDS,
+                   ADDRESS_CLEAN_COORDS, MOBILE_CLEAN_COORDS,
+                   ADM_WHITEOUT_COORDS, SESSION_WHITEOUT_COORDS]:
+        page.draw_rect(_tr_rect(tr, coords), color=WHITE, fill=WHITE, width=0, overlay=True)
+
+    redraw_blood_teardrop_transformed(page, tr, BLOOD_RED)
+
+    photo_url = student.get("photo_url", "")
+    photo_bytes = fetch_photo_bytes(photo_url)
+    if photo_bytes:
+        page.insert_image(
+            _tr_rect(tr, PHOTO_RECT_COORDS),
+            stream=photo_bytes,
+            overlay=True,
+            keep_proportion=False,
+        )
+
+    draw_text_vertically_centered(
+        page, _tr_rect(tr, NAME_TEXT_RECT_COORDS),
+        str(student.get("student_name", "")).strip().upper(),
+        anton_fn, fn_anton, anton_obj, _tr_font_size(tr, NAME_FONT_SIZE), NAME_COLOR,
+    )
+
+    cls = str(student.get("class", "")).strip().upper()
+    sec = str(student.get("section", "")).strip().upper()
+    roll = str(student.get("roll", "")).strip()
+    parts = []
+    if cls:
+        parts.append(f"CLASS:{cls}")
+    if sec:
+        parts.append(f"SEC:{sec}")
+    if roll:
+        parts.append(f"ROLL:{roll}")
+    draw_text_vertically_centered(
+        page, _tr_rect(tr, CLASS_TEXT_RECT_COORDS),
+        "  ".join(parts),
+        bold_fn, fn_bold, bold_obj, _tr_font_size(tr, CLASS_FONT_SIZE), NAME_COLOR,
+    )
+
+    for coords, key in [
+        (FATHER_VALUE_RECT_COORDS, "father_name"),
+        (MOTHER_VALUE_RECT_COORDS, "mother_name"),
+        (MOBILE_VALUE_RECT_COORDS, "mobile"),
+    ]:
+        rect = _tr_rect(tr, coords)
+        txt = str(student.get(key, "")).strip()
+        if txt and txt.lower() not in {"nan", "none"}:
+            sz = _fit_size(bold_obj, txt, rect.width, _tr_font_size(tr, VALUE_FONT_SIZE))
+            _put_single(page, rect, txt, bold_fn, fn_bold, sz, VALUE_COLOR, bold_obj)
+
+    dob = str(student.get("dob", "")).strip()
+    if dob and dob.lower() not in {"nan", "none"}:
+        rect = _tr_rect(tr, DOB_VALUE_RECT_COORDS)
+        sz = _fit_size(bold_obj, dob, rect.width, _tr_font_size(tr, VALUE_FONT_SIZE))
+        _put_single(page, rect, dob, bold_fn, fn_bold, sz, VALUE_COLOR, bold_obj)
+
+    render_address(
+        page, _tr_rect(tr, ADDRESS_VALUE_RECT_COORDS),
+        str(student.get("address", "")).strip(),
+        bold_fn, fn_bold, bold_obj, VALUE_COLOR,
+    )
+
+    adm = str(student.get("adm_no", "")).strip()
+    if adm and adm.lower() not in {"nan", "none"}:
+        rect = _tr_rect(tr, ADM_VALUE_RECT_COORDS)
+        sz = _fit_size(bold_obj, adm, rect.width, _tr_font_size(tr, ADM_FONT_SIZE))
+        _put_single(page, rect, adm, bold_fn, fn_bold, sz, VALUE_COLOR, bold_obj)
+
+    sess = str(student.get("session", "")).strip() or DEFAULT_SESSION
+    rect = _tr_rect(tr, SESSION_VALUE_RECT_COORDS)
+    sz = _fit_size(anton_obj, sess, rect.width, _tr_font_size(tr, SESSION_FONT_SIZE))
+    _put_single(page, rect, sess, anton_fn, fn_anton, sz, VALUE_COLOR, anton_obj)
+
+    blood = str(student.get("blood_group", "")).strip().upper()
+    if blood and blood.lower() not in {"nan", "none"} and any(c.isalpha() for c in blood):
+        draw_text_centered_hv(
+            page, _tr_rect(tr, BLOOD_VALUE_RECT_COORDS),
+            blood, bold_fn, fn_bold, bold_obj, _tr_font_size(tr, BLOOD_FONT_SIZE), WHITE,
+        )
+
+
+def draw_card_overlay_redeemer(page, student: dict, tr):
+    _draw_redeemer_overlay_core(
+        page,
+        student,
+        lambda x, y: _tr_point(tr, x, y),
+        lambda coords: _tr_rect(tr, coords),
+        tr["sx"],
+        tr["sy"],
+    )
+
+
+def draw_card_on_page(page, student: dict, target_rect, template_key: str, template_doc, template_source_rect):
+    page.show_pdf_page(target_rect, template_doc, 0, keep_proportion=False, overlay=True)
+    tr = _make_card_transform(template_source_rect, target_rect)
+    if template_key == "redeemer":
+        draw_card_overlay_redeemer(page, student, tr)
+    else:
+        draw_card_overlay_hebron(page, student, tr)
+
 # ─────────────────────────────────────────────────────────────────
 # SERIAL BADGE (vector, drawn directly on the output A4 page)
 # Unchanged from v2.0.
@@ -1106,93 +1769,73 @@ ROW_STEP   = CARD_H_PT + ROW_GAP_PT   # precomputed once
 #   4. gc.collect() once per batch, not once per page.
 # ─────────────────────────────────────────────────────────────────
 
-def build_pdf_file_vector(students: list) -> str | None:
+def build_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE) -> str | None:
     """
-    Build the final output PDF using vector-native placement.
-    Returns path to a temporary PDF file. Caller must delete it.
+    Build the final output PDF using a shared template XObject plus direct vector
+    drawing on the destination A4 page. This avoids creating an intermediate
+    1-page PDF per student, which previously prevented PyMuPDF from deduplicating
+    the template background across cards.
+
+    Result: much lower peak RAM, fewer PDF objects, and a substantially smaller
+    output file on low-memory Render instances.
     """
     if not HAS_FITZ:
         return None
-    if _ensure_template() is None:
-        print("DEBUG: Template PDF not found — using raster fallback")
+    template_key = normalize_template_key(template_key)
+    template_doc = _get_template_doc(template_key)
+    if template_doc is None:
+        print(f"DEBUG: Template PDF not found for {template_key} — using raster fallback")
         return None
 
-    n_pages     = (len(students) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE
-    tmp         = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=PDF_TEMP_DIR)
+    source_rect = fitz.Rect(template_doc[0].rect)
+    n_pages = (len(students) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=PDF_TEMP_DIR)
     tmp.close()
-    out_path    = tmp.name
-    first_write = True
+    out_path = tmp.name
+    GC_EVERY_PAGES = 20
 
+    out_doc = fitz.open()
     try:
-        # OPT-4: build and flush in batches of SAVE_BATCH_PAGES
-        for batch_start_page in range(0, n_pages, SAVE_BATCH_PAGES):
-            batch_end_page = min(batch_start_page + SAVE_BATCH_PAGES, n_pages)
-            batch_doc      = fitz.open()
+        for page_idx in range(n_pages):
+            student_start = page_idx * CARDS_PER_PAGE
+            student_batch = students[student_start: student_start + CARDS_PER_PAGE]
 
-            for page_idx in range(batch_start_page, batch_end_page):
-                student_start = page_idx * CARDS_PER_PAGE
-                student_batch = students[student_start : student_start + CARDS_PER_PAGE]
+            a4_page = out_doc.new_page(width=A4_W_PT, height=A4_H_PT)
 
-                a4_page = batch_doc.new_page(width=A4_W_PT, height=A4_H_PT)
+            for idx, student in enumerate(student_batch):
+                col = idx % COLS
+                row = idx // COLS
 
-                for idx, student in enumerate(student_batch):
-                    col = idx % COLS
-                    row = idx // COLS
+                card_x = OX_PT + col * COL_STEP
+                card_y = OY_PT + row * ROW_STEP
+                target_rect = fitz.Rect(card_x, card_y, card_x + CARD_W_PT, card_y + CARD_H_PT)
 
-                    card_x      = OX_PT + col * COL_STEP
-                    card_y      = OY_PT + row * ROW_STEP
-                    target_rect = fitz.Rect(card_x, card_y, card_x + CARD_W_PT, card_y + CARD_H_PT)
+                draw_card_on_page(
+                    a4_page, student, target_rect, template_key,
+                    template_doc=template_doc, template_source_rect=source_rect,
+                )
 
-                    card_doc = render_card_pdf(student)
-                    if card_doc is None:
-                        continue
-
-                    a4_page.show_pdf_page(target_rect, card_doc, 0, keep_proportion=False)
-                    card_doc.close()   # free immediately after placement
-
-                    if row < ROWS - 1:
-                        gap_top  = card_y + CARD_H_PT
-                        badge_cx = card_x + CARD_W_PT / 2.0
-                        badge_cy = gap_top + ROW_GAP_PT / 2.0
-                        draw_serial_badge_vector(
-                            a4_page,
-                            student_start + idx + 1,
-                            badge_cx, badge_cy,
-                            ROW_GAP_PT,
-                        )
-
-            # ── Flush this batch to disk ──────────────────────────
-            # ── Flush this batch to disk ──────────────────────────
-            try:
-                if first_write:
-                    batch_doc.save(
-                        out_path,
-                        deflate=True, deflate_images=True, deflate_fonts=True,
-                        garbage=4, clean=True, linear=False,
+                if row < ROWS - 1:
+                    gap_top = card_y + CARD_H_PT
+                    badge_cx = card_x + CARD_W_PT / 2.0
+                    badge_cy = gap_top + ROW_GAP_PT / 2.0
+                    draw_serial_badge_vector(
+                        a4_page,
+                        student_start + idx + 1,
+                        badge_cx, badge_cy,
+                        ROW_GAP_PT,
                     )
-                    first_write = False
-                else:
-                    # Save merged result to a temp file, then atomically replace out_path.
-                    # Cannot save fitz.open(out_path) back to out_path with incremental=False.
-                    tmp_merge = out_path + ".merge.pdf"
-                    try:
-                        existing = fitz.open(out_path)
-                        existing.insert_pdf(batch_doc)
-                        existing.save(
-                            tmp_merge,
-                            deflate=True, deflate_images=True, deflate_fonts=True,
-                            garbage=4, clean=True,
-                        )
-                        existing.close()
-                        os.replace(tmp_merge, out_path)   # atomic on POSIX
-                    except Exception:
-                        if os.path.exists(tmp_merge):
-                            try: os.unlink(tmp_merge)
-                            except: pass
-                        raise
-            finally:
-                batch_doc.close()
+
+            if (page_idx + 1) % GC_EVERY_PAGES == 0:
                 gc.collect()
+
+        print(f"DEBUG: saving {n_pages} A4 pages to disk…")
+        out_doc.save(
+            out_path,
+            deflate=True, deflate_images=True, deflate_fonts=True,
+            garbage=4, clean=True, linear=False,
+        )
+        print(f"DEBUG: PDF saved ({os.path.getsize(out_path)//1024} KB)")
         return out_path
 
     except Exception:
@@ -1202,6 +1845,9 @@ def build_pdf_file_vector(students: list) -> str | None:
         except Exception:
             pass
         raise
+    finally:
+        out_doc.close()
+        gc.collect()
 
 # ─────────────────────────────────────────────────────────────────
 # RASTER FALLBACK (used only when template PDF is missing)
@@ -1270,14 +1916,15 @@ def build_pdf_file_raster_fallback(students, dpi=150):
 # UNIFIED PDF BUILDER
 # ─────────────────────────────────────────────────────────────────
 
-def build_pdf_file(students, dpi=150):
+def build_pdf_file(students, dpi=150, template_key: str = DEFAULT_TEMPLATE):
     """
     Primary entry point for PDF generation.
     Prefers vector-native path; falls back to raster if template is missing.
     """
-    if HAS_FITZ and TEMPLATE_PDF.exists():
-        return build_pdf_file_vector(students)
-    print("DEBUG: Template PDF not found — using raster fallback")
+    template = get_template_config(template_key)
+    if HAS_FITZ and template["pdf"].exists():
+        return build_pdf_file_vector(students, template_key=template["key"])
+    print(f"DEBUG: Template PDF not found for {template['key']} — using raster fallback")
     return build_pdf_file_raster_fallback(students, dpi=dpi)
 
 # ─────────────────────────────────────────────────────────────────
@@ -1288,7 +1935,7 @@ def build_pdf_file(students, dpi=150):
 #         LRU eviction handles memory automatically.
 # ─────────────────────────────────────────────────────────────────
 
-def send_generated_pdf(students, dpi, download_name, as_attachment, allow_external=False):
+def send_generated_pdf(students, dpi, download_name, as_attachment, allow_external=False, template_key: str = DEFAULT_TEMPLATE):
     if not students:
         return jsonify({"error": "No students loaded"}), 400
     if len(students) > MAX_STUDENTS_PER_REQUEST:
@@ -1299,10 +1946,11 @@ def send_generated_pdf(students, dpi, download_name, as_attachment, allow_extern
             )
         }), 413
 
-    # OPT-5: parallel photo prefetch fills LRU cache before render loop
-    prefetch_photos(students)
+    if (not as_attachment) and len(students) >= PREVIEW_EXTERNAL_THRESHOLD and _external_storage_enabled():
+        allow_external = True
 
-    pdf_path = build_pdf_file(students, dpi=dpi)
+    prefetch_photos(students)
+    pdf_path = build_pdf_file(students, dpi=dpi, template_key=template_key)
     if not pdf_path:
         return jsonify({"error": "PDF generation failed — check server libs"}), 500
 
@@ -1339,39 +1987,86 @@ def send_generated_pdf(students, dpi, download_name, as_attachment, allow_extern
     )
 
 # ─────────────────────────────────────────────────────────────────
+# TEMPLATE API
+# ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/templates", methods=["GET"])
+@app.route("/templates", methods=["GET"])
+def get_templates():
+    payload = []
+    for key, template in TEMPLATE_CONFIGS.items():
+        payload.append({
+            "key": key,
+            "label": template["label"],
+            "display_name": template["display_name"],
+            "description": template["description"],
+            "fields": template["fields"],
+            "preview_url": f"/api/templates/{key}/preview.png",
+        })
+    return jsonify(payload)
+
+
+@app.route("/api/templates/<template_key>/preview.png", methods=["GET"])
+@app.route("/templates/<template_key>/preview.png", methods=["GET"])
+def get_template_preview(template_key):
+    png_bytes = _get_template_preview_png(template_key)
+    if not png_bytes:
+        return jsonify({"error": "Template preview unavailable"}), 404
+    return send_file(io.BytesIO(png_bytes), mimetype="image/png", download_name=f"{normalize_template_key(template_key)}_preview.png")
+
+
+def _request_template_key():
+    raw = request.args.get("template", DEFAULT_TEMPLATE)
+    key = str(raw or DEFAULT_TEMPLATE).strip().lower()
+    if key not in TEMPLATE_CONFIGS:
+        return None, jsonify({"error": f"Unknown template: {raw}"}), 400
+    return key, None, None
+
+# ─────────────────────────────────────────────────────────────────
 # PDF / PREVIEW ENDPOINTS
 # ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/preview/all", methods=["GET"])
 @app.route("/preview/all", methods=["GET"])
 def preview_all():
+    template_key, err_resp, err_code = _request_template_key()
+    if err_resp:
+        return err_resp, err_code
     students = _store["students"]
     if not students:
         return jsonify({"error": "No students loaded"}), 400
     cls      = request.args.get("class","").strip().upper()
     students = filter_students_by_class(students, cls)
     return send_generated_pdf(students, dpi=PREVIEW_DPI,
-                              download_name="preview.pdf", as_attachment=False)
+                              download_name=f"preview_{template_key}.pdf", as_attachment=False,
+                              template_key=template_key)
 
 @app.route("/api/download/all", methods=["GET"])
 @app.route("/download/all", methods=["GET"])
 def download_all():
+    template_key, err_resp, err_code = _request_template_key()
+    if err_resp:
+        return err_resp, err_code
     students = _store["students"]
     if not students:
         return jsonify({"error": "No students loaded"}), 400
     cls = request.args.get("class","").strip().upper()
     if cls:
         students = filter_students_by_class(students, cls)
-        fname    = f"ids_{cls}.pdf"
+        fname    = f"ids_{template_key}_{cls}.pdf"
     else:
         students = list(students)
-        fname    = "ids_ALL.pdf"
+        fname    = f"ids_{template_key}_ALL.pdf"
     return send_generated_pdf(students, dpi=DOWNLOAD_DPI,
-                              download_name=fname, as_attachment=True, allow_external=True)
+                              download_name=fname, as_attachment=True, allow_external=True,
+                              template_key=template_key)
 
 @app.route("/api/preview/student", methods=["GET"])
 @app.route("/preview/student", methods=["GET"])
 def preview_student():
+    template_key, err_resp, err_code = _request_template_key()
+    if err_resp:
+        return err_resp, err_code
     students = _store["students"]
     cls      = request.args.get("class","").strip().upper()
     name     = request.args.get("name","").strip().lower()
@@ -1383,11 +2078,15 @@ def preview_student():
     if not matches:
         return jsonify({"error": "Student not found"}), 404
     return send_generated_pdf([matches[0]], dpi=PREVIEW_DPI,
-                              download_name="preview_student.pdf", as_attachment=False)
+                              download_name=f"preview_student_{template_key}.pdf", as_attachment=False,
+                              template_key=template_key)
 
 @app.route("/api/download/student", methods=["GET"])
 @app.route("/download/student", methods=["GET"])
 def download_student():
+    template_key, err_resp, err_code = _request_template_key()
+    if err_resp:
+        return err_resp, err_code
     students = _store["students"]
     cls      = request.args.get("class","").strip().upper()
     name     = request.args.get("name","").strip().lower()
@@ -1401,14 +2100,16 @@ def download_student():
     student   = matches[0]
     safe_name = student.get("student_name","student").replace(" ","_")
     return send_generated_pdf([student], dpi=DOWNLOAD_DPI,
-                              download_name=f"id_{safe_name}.pdf", as_attachment=True, allow_external=True)
+                              download_name=f"id_{template_key}_{safe_name}.pdf", as_attachment=True, allow_external=True,
+                              template_key=template_key)
 
 # ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ck = '\u2713'; xk = '\u2717'
     print("=" * 60)
     print("  ID Card Generator Backend  v2.1  (vector-native, optimized)")
-    print(f"  Template PDF : {ck+' found' if TEMPLATE_PDF.exists() else xk+' NOT FOUND (raster fallback)'}")
+    print(f"  Hebron PDF   : {ck+' found' if TEMPLATE_PDF_HEBRON.exists() else xk+' NOT FOUND (raster fallback)'}")
+    print(f"  Redeemer PDF : {ck+' found' if TEMPLATE_PDF_REDEEMER.exists() else xk+' NOT FOUND (raster fallback)'}")
     print(f"  Anton font   : {ck+' found' if ANTON_FONT.exists() else xk+' NOT FOUND'}")
     print(f"  Arial Bold   : {ck+' found' if ARIAL_BOLD.exists() else xk+' NOT FOUND'}")
     print(f"  PyMuPDF      : {ck if HAS_FITZ else xk+' pip install pymupdf'}")
