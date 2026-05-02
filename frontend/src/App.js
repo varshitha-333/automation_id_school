@@ -25,32 +25,6 @@ import {
 } from 'lucide-react';
 import './App.css';
 
-/* ─── Restart banner CSS (injected once) ─────────────────── */
-const RESTART_BANNER_CSS = `
-.restart-banner {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 20px;
-  background: #FEF3C7;
-  border-bottom: 2px solid #F59E0B;
-  color: #92400E;
-  font-size: 13px;
-  font-weight: 500;
-  position: sticky;
-  top: 0;
-  z-index: 200;
-}
-.restart-banner svg { flex-shrink: 0; color: #D97706; }
-.restart-banner span { flex: 1; }
-`;
-if (typeof document !== 'undefined' && !document.getElementById('restart-banner-style')) {
-  const s = document.createElement('style');
-  s.id = 'restart-banner-style';
-  s.textContent = RESTART_BANNER_CSS;
-  document.head.appendChild(s);
-}
-
 /* ─── API helpers ─────────────────────────────────────────── */
 const normalizeApiBase = (rawValue) => {
   const value = (rawValue || '').trim();
@@ -61,6 +35,9 @@ const normalizeApiBase = (rawValue) => {
 
 const API        = normalizeApiBase(process.env.REACT_APP_API_URL || '/api');
 const API_ORIGIN = (process.env.REACT_APP_API_URL || '').replace(/\/+$/, '');
+
+// Send session cookie on every request so Flask knows which session we're in
+axios.defaults.withCredentials = true;
 
 /* ─── Fallback templates ──────────────────────────────────── */
 const TEMPLATE_COLORS = {
@@ -112,21 +89,6 @@ const FALLBACK_TEMPLATES = [
 const INITIAL_STATUS = { loaded: false, count: 0, classes: [], classCounts: {} };
 
 /* ─── Utilities ───────────────────────────────────────────── */
-
-/**
- * When axios uses responseType:'blob', error responses (400, 500…) ALSO
- * arrive as Blobs. We must read them back to surface a useful error message.
- */
-const readBlobError = async (blob) => {
-  try {
-    const text = await (blob instanceof Blob ? blob : new Blob([blob])).text();
-    const parsed = JSON.parse(text);
-    return parsed.error || parsed.message || text || 'Server error';
-  } catch {
-    return 'No students loaded — please reload student data and try again';
-  }
-};
-
 const openExternalOrBlob = async (resp, fallbackName, onPreview) => {
   const contentType = (resp.headers?.['content-type'] || resp.data?.type || '').toLowerCase();
   if (contentType.includes('application/json')) {
@@ -208,6 +170,38 @@ function Select({ value, onChange, options, placeholder, disabled }) {
 /* ─── Loading dots ────────────────────────────────────────── */
 function Dots() {
   return <span className="loading-dots"><span /><span /><span /></span>;
+}
+
+/* ─── Download Progress Pill ──────────────────────────────── */
+function DownloadProgress({ progress, onCancel }) {
+  if (!progress) return null;
+  const { pct, detail, eta, label } = progress;
+  const indet = pct === -1;
+  return (
+    <div className="dl-progress-overlay">
+      <div className="dl-progress-pill">
+        <div className="dl-progress-top">
+          <div className="dl-progress-icon">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+          </div>
+          <div className="dl-progress-info">
+            <div className="dl-progress-label" title={label}>{label}</div>
+            <div className="dl-progress-detail">{indet ? detail : `${detail}${eta ? ' · ' + eta : ''}`}</div>
+          </div>
+          {!indet && <div className="dl-progress-pct">{pct}%</div>}
+          <button className="dl-progress-cancel" onClick={onCancel} title="Cancel">✕</button>
+        </div>
+        <div className="dl-progress-bar-track">
+          {indet
+            ? <div className="dl-progress-bar-indeterminate" />
+            : <div className="dl-progress-bar-fill" style={{ width: `${pct}%` }} />}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /* ─── Template card ───────────────────────────────────────── */
@@ -318,14 +312,16 @@ export default function App() {
   const [studentNames, setStudentNames]         = useState([]);
   const [studentLoading, setStudentLoading]     = useState(null);
   const [backendOk, setBackendOk]               = useState(null);
-  const [backendWasLost, setBackendWasLost]     = useState(false); // backend restarted while page was open
   const [activeStep, setActiveStep]             = useState(0);
   const [searchQuery, setSearchQuery]           = useState('');
   const [showAdvanced, setShowAdvanced]         = useState(false);
   const [generationDone, setGenerationDone]     = useState(false);
+  const [schoolId, setSchoolId]                 = useState(null); // numeric school_id for session fallback
+  const [dlProgress, setDlProgress]             = useState(null); // {pct, detail, eta, label}
 
   const fileRef    = useRef(null);
   const toastIdRef = useRef(0);
+  const xhrRef     = useRef(null);
 
   /* ── Toast helpers ── */
   const addToast = useCallback((message, type = 'info', duration = 4000) => {
@@ -347,15 +343,11 @@ export default function App() {
     templates.find((t) => t.key === selectedTemplate) || templates[0] || FALLBACK_TEMPLATES[0],
     [templates, selectedTemplate]);
 
-  useEffect(() => {
-    console.log('[DEBUG] selectedTemplate state changed =>', selectedTemplate);
-  }, [selectedTemplate]);
-
   const withTemplate = useCallback((baseUrl, extra = {}) => {
-    const params = new URLSearchParams({ ...extra, template: selectedTemplate });
-    console.log('[DEBUG] withTemplate called | selectedTemplate =', selectedTemplate, '| url =', `${baseUrl}?${params.toString()}`);
+    const sid = schoolId ? { school_id: schoolId } : {};
+    const params = new URLSearchParams({ ...sid, ...extra, template: selectedTemplate });
     return `${baseUrl}?${params.toString()}`;
-  }, [selectedTemplate]);
+  }, [selectedTemplate, schoolId]);
 
   const totalClasses    = (status.classes || []).length;
   const classOptions    = (status.classes || []).map((c) => ({ value: c, label: `Class ${c}` }));
@@ -378,20 +370,10 @@ export default function App() {
   /* ── Boot ── */
   const refreshStatus = useCallback(() => {
     axios.get(`${API}/status`).then((r) => {
-      const wasOffline = backendOk === false;
       setBackendOk(true);
-      const newStatus = { ...INITIAL_STATUS, ...r.data, classCounts: r.data?.classCounts || r.data?.class_counts || {} };
-      setStatus((prev) => {
-        // Backend restarted and wiped its in-memory store while we had data loaded
-        if (wasOffline && prev.loaded && !newStatus.loaded) {
-          setBackendWasLost(true);
-        }
-        return newStatus;
-      });
-    }).catch(() => {
-      setBackendOk(false);
-    });
-  }, [backendOk]);
+      setStatus({ ...INITIAL_STATUS, ...r.data, classCounts: r.data?.classCounts || r.data?.class_counts || {} });
+    }).catch(() => setBackendOk(false));
+  }, []);
 
   useEffect(() => {
     refreshStatus();
@@ -409,12 +391,6 @@ export default function App() {
       setTemplates(list);
       setSelectedTemplate((prev) => list.some((t) => t.key === prev) ? prev : list[0]?.key || 'redeemer');
     }).catch(() => setTemplates(FALLBACK_TEMPLATES)).finally(() => setLoadingTemplates(false));
-  }, [refreshStatus]);
-
-  /* ── Heartbeat: poll /api/status every 8 s to detect backend restart ── */
-  useEffect(() => {
-    const timer = setInterval(refreshStatus, 8000);
-    return () => clearInterval(timer);
   }, [refreshStatus]);
 
   useEffect(() => {
@@ -459,6 +435,7 @@ export default function App() {
     setFetchingAPI(true);
     try {
       const { data } = await axios.get(`${API}/fetch-school/${selectedSchool}`);
+      if (data.school_id) setSchoolId(data.school_id);
       handleSuccessfulLoad(data, 'api', data.school);
       addToast(`Fetched ${data.count} students from ${data.school}`, 'success', 5000);
     } catch (err) {
@@ -469,46 +446,89 @@ export default function App() {
   /* ── PDF actions ── */
   const registerDone = useCallback(() => setGenerationDone(true), []);
 
-  const downloadPDF = async (cls = null) => {
-    const key = cls ? `${cls}_dl` : 'all_dl';
-    console.log('[DEBUG] downloadPDF clicked | cls =', cls, '| selectedTemplate STATE =', selectedTemplate);
+  const cancelDownload = useCallback(() => {
+    if (xhrRef.current) { try { xhrRef.current.abort(); } catch (_) {} xhrRef.current = null; }
+    setDlProgress(null); setCardLoading(null);
+    addToast('Download cancelled', 'info');
+  }, [addToast]);
+
+  const downloadPDF = (cls = null) => {
+    const key   = cls ? `${cls}_dl` : 'all_dl';
+    const fname = cls ? `ids_${selectedTemplate}_${cls}.pdf` : `ids_${selectedTemplate}_ALL.pdf`;
+    const url   = cls ? withTemplate(`${API}/download/all`, { class: cls }) : withTemplate(`${API}/download/all`);
     setCardLoading(key);
-    try {
-      const url = cls ? withTemplate(`${API}/download/all`, { class: cls }) : withTemplate(`${API}/download/all`);
-      console.log('[DEBUG] downloadPDF | final URL =', url);
-      const resp = await axios.get(url, { responseType: 'blob' });
-      console.log('[DEBUG] downloadPDF | response status =', resp.status, '| content-type =', resp.headers['content-type'], '| content-disposition =', resp.headers['content-disposition']);
-      const result = await openExternalOrBlob(resp, cls ? `ids_${selectedTemplate}_${cls}.pdf` : `ids_${selectedTemplate}_ALL.pdf`);
-      registerDone();
-      addToast(result.external ? 'PDF opened from cloud storage' : 'PDF downloaded', 'success');
-    } catch (err) {
-      console.error('[DEBUG] downloadPDF ERROR:', err?.response?.status, err?.message);
-      const msg = err?.response?.data
-        ? await readBlobError(err.response.data)
-        : (err?.message?.includes('Network') ? 'Backend offline — restart Flask and reload data' : 'Download failed');
-      addToast(msg, 'error', 7000);
-    } finally { setCardLoading(null); }
+    setDlProgress({ pct: 0, detail: 'Starting…', eta: null, label: fname });
+    if (xhrRef.current) { try { xhrRef.current.abort(); } catch (_) {} }
+    const xhr = new XMLHttpRequest();
+    xhrRef.current = xhr;
+    xhr.open('GET', url, true);
+    xhr.responseType = 'blob';
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('Accept', 'application/pdf,*/*');
+    const t0 = Date.now();
+    xhr.onprogress = (e) => {
+      const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+      if (e.lengthComputable && e.total > 0) {
+        const pct  = Math.round((e.loaded / e.total) * 100);
+        const secs = (Date.now() - t0) / 1000;
+        const rem  = secs > 0 ? (e.total - e.loaded) / (e.loaded / secs) : null;
+        const eta  = rem != null ? (rem < 60 ? `${Math.ceil(rem)}s left` : `${Math.ceil(rem / 60)}m left`) : null;
+        setDlProgress({ pct, detail: `${mb(e.loaded)} / ${mb(e.total)} MB`, eta, label: fname });
+      } else {
+        setDlProgress((p) => ({ ...(p || {}), pct: -1, detail: `${mb(e.loaded)} MB downloaded…`, eta: null, label: fname }));
+      }
+    };
+    xhr.onload = () => {
+      setDlProgress(null); setCardLoading(null); xhrRef.current = null;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const ct = (xhr.getResponseHeader('Content-Type') || '').toLowerCase();
+        if (ct.includes('application/json')) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            try {
+              const p = JSON.parse(reader.result);
+              if (p.download_url) { window.open(p.download_url, '_blank', 'noopener,noreferrer'); registerDone(); addToast('PDF opened from cloud storage', 'success'); }
+              else addToast(p.error || 'Download failed', 'error');
+            } catch (_) { addToast('Download failed', 'error'); }
+          };
+          reader.readAsText(xhr.response);
+          return;
+        }
+        const blobUrl = URL.createObjectURL(xhr.response);
+        const a = document.createElement('a');
+        a.href = blobUrl; a.download = fname;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+        registerDone();
+        addToast(`✓ ${fname} downloaded`, 'success');
+      } else {
+        const reader = new FileReader();
+        reader.onload = () => {
+          try { const p = JSON.parse(reader.result); addToast(p.error || `Download failed (${xhr.status})`, 'error'); }
+          catch (_) { addToast(`Download failed (${xhr.status})`, 'error'); }
+        };
+        reader.onerror = () => addToast(`Download failed (${xhr.status})`, 'error');
+        reader.readAsText(xhr.response);
+      }
+    };
+    xhr.onerror = () => { setDlProgress(null); setCardLoading(null); xhrRef.current = null; addToast('Network error — download failed', 'error'); };
+    xhr.onabort = () => { setDlProgress(null); setCardLoading(null); xhrRef.current = null; };
+    xhr.send();
   };
 
   const viewPDF = async (cls = null) => {
     const key = cls ? `${cls}_view` : 'all_view';
-    console.log('[DEBUG] viewPDF clicked | cls =', cls, '| selectedTemplate STATE =', selectedTemplate);
     setCardLoading(key);
     try {
-      const url = cls ? withTemplate(`${API}/preview/all`, { class: cls }) : withTemplate(`${API}/preview/all`);
-      console.log('[DEBUG] viewPDF | final URL =', url);
-      const resp = await axios.get(url, { responseType: 'blob' });
-      console.log('[DEBUG] viewPDF | response status =', resp.status, '| content-type =', resp.headers['content-type']);
+      const url  = cls ? withTemplate(`${API}/preview/all`, { class: cls }) : withTemplate(`${API}/preview/all`);
+      const resp = await axios.get(url, { responseType: 'blob', withCredentials: true });
       await openExternalOrBlob(resp, 'preview.pdf', (u, ext) => {
         setModal({ url: u, title: cls ? `Class ${cls} — Preview` : 'All Students — Preview', external: ext });
       });
       registerDone();
     } catch (err) {
       console.error('[DEBUG] viewPDF ERROR:', err?.response?.status, err?.message);
-      const msg = err?.response?.data
-        ? await readBlobError(err.response.data)
-        : (err?.message?.includes('Network') ? 'Backend offline — restart Flask and reload data' : 'Preview failed');
-      addToast(msg, 'error', 7000);
+      addToast(err.response?.data?.error || 'Preview failed', 'error');
     } finally { setCardLoading(null); }
   };
 
@@ -520,10 +540,7 @@ export default function App() {
       await openExternalOrBlob(resp, 'preview_student.pdf', (u, ext) => setModal({ url: u, title: `${studentName} — Preview`, external: ext }));
       registerDone();
     } catch (err) {
-      const msg = err?.response?.data
-        ? await readBlobError(err.response.data)
-        : 'Preview failed — check backend is running';
-      addToast(msg, 'error', 7000);
+      addToast(err.response?.data?.error || 'Preview failed', 'error');
     } finally { setStudentLoading(null); }
   };
 
@@ -536,10 +553,7 @@ export default function App() {
       registerDone();
       addToast(result.external ? 'Card opened from cloud storage' : 'Card downloaded', 'success');
     } catch (err) {
-      const msg = err?.response?.data
-        ? await readBlobError(err.response.data)
-        : 'Download failed — check backend is running';
-      addToast(msg, 'error', 7000);
+      addToast(err.response?.data?.error || 'Download failed', 'error');
     } finally { setStudentLoading(null); }
   };
 
@@ -580,26 +594,8 @@ export default function App() {
   return (
     <div className="app-shell">
       <Toast toasts={toasts} removeToast={removeToast} />
+      <DownloadProgress progress={dlProgress} onCancel={cancelDownload} />
       {modal && <PDFModal url={modal.url} title={modal.title} external={modal.external} onClose={closeModal} />}
-
-      {/* ── Stale-data warning: shown when backend restarted and wiped student data ── */}
-      {backendWasLost && (
-        <div className="restart-banner">
-          <AlertCircle size={15} />
-          <span>
-            <strong>Backend was restarted</strong> — student data was cleared.
-            Please re-upload your file or re-fetch from the API before downloading.
-          </span>
-          <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-            <button className="btn btn-primary btn-sm" onClick={() => { setBackendWasLost(false); setActiveStep(1); }}>
-              Reload data →
-            </button>
-            <button className="btn btn-ghost btn-sm" onClick={() => setBackendWasLost(false)}>
-              <X size={13} />
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* ── Top bar ── */}
       <header className="topbar">
