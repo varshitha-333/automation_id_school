@@ -37,6 +37,13 @@ const API        = normalizeApiBase(process.env.REACT_APP_API_URL || '/api');
 const API_ORIGIN = (process.env.REACT_APP_API_URL || '').replace(/\/+$/, '');
 
 /* ─── Fallback templates ──────────────────────────────────── */
+const TEMPLATE_COLORS = {
+  hebron:    '#DC2626',
+  redeemer:  '#4F46E5',
+  priyanka:  '#0F006A',
+  ab_ascent: '#224499',
+};
+
 const FALLBACK_TEMPLATES = [
   {
     key: 'hebron',
@@ -55,6 +62,24 @@ const FALLBACK_TEMPLATES = [
     fields: ['student_name', 'class', 'father_name', 'dob', 'mobile', 'address', 'session'],
     preview_url: `${API_ORIGIN}/api/templates/redeemer/preview.png`,
     color: '#4F46E5',
+  },
+  {
+    key: 'priyanka',
+    label: 'Priyanka',
+    display_name: 'Priyanka Dreamnest School',
+    description: 'Dark blue layout — includes name, class, section, roll, parent details, DOB, address and contact.',
+    fields: ['student_name', 'class', 'section', 'roll', 'father_name', 'mother_name', 'dob', 'address', 'mobile', 'session'],
+    preview_url: `${API_ORIGIN}/api/templates/priyanka/preview.png`,
+    color: '#0F006A',
+  },
+  {
+    key: 'ab_ascent',
+    label: 'Ab Ascent',
+    display_name: 'Ab Ascent School',
+    description: 'Navy blue layout — includes adm no, name, class, section, roll, parent details, DOB, address, mobile and blood group.',
+    fields: ['student_name', 'class', 'section', 'roll', 'father_name', 'mother_name', 'dob', 'address', 'mobile', 'adm_no', 'blood_group', 'session'],
+    preview_url: `${API_ORIGIN}/api/templates/ab_ascent/preview.png`,
+    color: '#224499',
   },
 ];
 
@@ -324,7 +349,7 @@ export default function App() {
       const raw = Array.isArray(r.data) && r.data.length ? r.data : FALLBACK_TEMPLATES;
       const list = raw.map((t) => ({
         ...t,
-        color: t.color || (t.key === 'hebron' ? '#DC2626' : '#4F46E5'),
+        color: t.color || TEMPLATE_COLORS[t.key] || '#4F46E5',
         preview_url: t.preview_url
           ? (t.preview_url.startsWith('http') ? t.preview_url : `${API_ORIGIN}${t.preview_url.startsWith('/') ? '' : '/'}${t.preview_url}`)
           : `${API_ORIGIN}/api/templates/${t.key}/preview.png`,
