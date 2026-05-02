@@ -36,23 +36,7 @@ const normalizeApiBase = (rawValue) => {
 const API        = normalizeApiBase(process.env.REACT_APP_API_URL || '/api');
 const API_ORIGIN = (process.env.REACT_APP_API_URL || '').replace(/\/+$/, '');
 
-// ── Persistent session ID ─────────────────────────────────────────
-// Stored in localStorage so it survives page refreshes.
-// Sent as X-Session-ID header on every request — avoids ALL cookie/SameSite issues.
-const _getOrCreateSessionId = () => {
-  try {
-    let sid = localStorage.getItem('idcard_session_id');
-    if (!sid || sid.length < 16) {
-      sid = crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '') : Math.random().toString(36).slice(2) + Date.now().toString(36);
-      localStorage.setItem('idcard_session_id', sid);
-    }
-    return sid;
-  } catch (_) {
-    return Math.random().toString(36).slice(2) + Date.now().toString(36);
-  }
-};
-const SESSION_ID = _getOrCreateSessionId();
-axios.defaults.headers.common['X-Session-ID'] = SESSION_ID;
+axios.defaults.headers.common['X-Requested-With'] = 'XMLHttpRequest';
 
 /* ─── Fallback templates ──────────────────────────────────── */
 const TEMPLATE_COLORS = {
@@ -120,7 +104,7 @@ const openExternalOrBlob = async (resp, fallbackName, onPreview) => {
   if (onPreview) { onPreview(blobUrl, false); return { external: false, blobUrl }; }
   const a = document.createElement('a');
   a.href = blobUrl; a.download = fallbackName; a.click();
-  URL.revokeObjectURL(a.href);
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   return { external: false, blobUrl };
 };
 
@@ -185,38 +169,6 @@ function Select({ value, onChange, options, placeholder, disabled }) {
 /* ─── Loading dots ────────────────────────────────────────── */
 function Dots() {
   return <span className="loading-dots"><span /><span /><span /></span>;
-}
-
-/* ─── Download Progress Pill ──────────────────────────────── */
-function DownloadProgress({ progress, onCancel }) {
-  if (!progress) return null;
-  const { pct, detail, eta, label } = progress;
-  const indet = pct === -1;
-  return (
-    <div className="dl-progress-overlay">
-      <div className="dl-progress-pill">
-        <div className="dl-progress-top">
-          <div className="dl-progress-icon">
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-            </svg>
-          </div>
-          <div className="dl-progress-info">
-            <div className="dl-progress-label" title={label}>{label}</div>
-            <div className="dl-progress-detail">{indet ? detail : `${detail}${eta ? ' · ' + eta : ''}`}</div>
-          </div>
-          {!indet && <div className="dl-progress-pct">{pct}%</div>}
-          <button className="dl-progress-cancel" onClick={onCancel} title="Cancel">✕</button>
-        </div>
-        <div className="dl-progress-bar-track">
-          {indet
-            ? <div className="dl-progress-bar-indeterminate" />
-            : <div className="dl-progress-bar-fill" style={{ width: `${pct}%` }} />}
-        </div>
-      </div>
-    </div>
-  );
 }
 
 /* ─── Template card ───────────────────────────────────────── */
@@ -304,6 +256,20 @@ function TplSkeleton() {
   );
 }
 
+/* ─── Time estimator ──────────────────────────────────────── */
+function estimateTime(count, template) {
+  // Based on measured timings from backend docstring (local = ~2x faster than prod)
+  // These are prod (0.5 CPU / 512 MB) estimates. Local will be faster.
+  // ab_ascent/priyanka are heavier per-card renderers than hebron/redeemer
+  const heavy = ['ab_ascent', 'priyanka'].includes(template);
+  const secPerStudent = heavy ? 0.43 : 0.32; // prod estimate
+  const secs = Math.round(count * secPerStudent);
+  if (secs < 60) return `~${secs}s`;
+  const mins = Math.floor(secs / 60);
+  const rem  = secs % 60;
+  return rem > 0 ? `~${mins}m ${rem}s` : `~${mins}m`;
+}
+
 /* ─────────────────────────────────────────────────────────────
    MAIN APP
    ───────────────────────────────────────────────────────────── */
@@ -331,12 +297,16 @@ export default function App() {
   const [searchQuery, setSearchQuery]           = useState('');
   const [showAdvanced, setShowAdvanced]         = useState(false);
   const [generationDone, setGenerationDone]     = useState(false);
-  const [schoolId, setSchoolId]                 = useState(null); // numeric school_id for session fallback
-  const [dlProgress, setDlProgress]             = useState(null); // {pct, detail, eta, label}
+  const [genProgress, setGenProgress]           = useState(0);
+  const [genPhase,    setGenPhase]              = useState('');
+  const [genLabel,    setGenLabel]              = useState('');   // human-readable label for active job
+  const [elapsedSecs, setElapsedSecs]           = useState(0);   // wall-clock seconds since job start
 
-  const fileRef    = useRef(null);
-  const toastIdRef = useRef(0);
-  const xhrRef     = useRef(null);
+  const fileRef      = useRef(null);
+  const toastIdRef   = useRef(0);
+  const elapsedTimer = useRef(null);   // interval for wall-clock counter
+  const activeJobId  = useRef(null);   // track running job so we can cancel on unmount
+  const jobDoneRef   = useRef(false);  // true once server reports status=done — never DELETE then
 
   /* ── Toast helpers ── */
   const addToast = useCallback((message, type = 'info', duration = 4000) => {
@@ -353,16 +323,27 @@ export default function App() {
     window.setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 350);
   }, []);
 
+  /* cleanup on unmount */
+  useEffect(() => {
+    return () => {
+      if (elapsedTimer.current) clearInterval(elapsedTimer.current);
+      // Only cancel jobs that are still running — never delete a finished job,
+      // otherwise the file gets wiped before the download can start.
+      if (activeJobId.current && !jobDoneRef.current) {
+        axios.delete(`${API}/jobs/${activeJobId.current}`).catch(() => {});
+      }
+    };
+  }, []);
+
   /* ── Derived ── */
   const activeTemplate = useMemo(() =>
     templates.find((t) => t.key === selectedTemplate) || templates[0] || FALLBACK_TEMPLATES[0],
     [templates, selectedTemplate]);
 
   const withTemplate = useCallback((baseUrl, extra = {}) => {
-    const sid = schoolId ? { school_id: schoolId } : {};
-    const params = new URLSearchParams({ ...sid, ...extra, template: selectedTemplate });
+    const params = new URLSearchParams({ ...extra, template: selectedTemplate });
     return `${baseUrl}?${params.toString()}`;
-  }, [selectedTemplate, schoolId]);
+  }, [selectedTemplate]);
 
   const totalClasses    = (status.classes || []).length;
   const classOptions    = (status.classes || []).map((c) => ({ value: c, label: `Class ${c}` }));
@@ -370,25 +351,62 @@ export default function App() {
     const q = searchQuery.trim().toLowerCase();
     return q ? (status.classes || []).filter((c) => String(c).toLowerCase().includes(q)) : (status.classes || []);
   }, [searchQuery, status.classes]);
-  const isLargeBatch = Boolean(status.loaded) && Number(status.count || 0) > 70;
+
+  /* ── Elapsed timer helpers ── */
+  const startElapsed = useCallback(() => {
+    setElapsedSecs(0);
+    if (elapsedTimer.current) clearInterval(elapsedTimer.current);
+    elapsedTimer.current = setInterval(() => setElapsedSecs((s) => s + 1), 1000);
+  }, []);
+
+  const stopElapsed = useCallback(() => {
+    if (elapsedTimer.current) { clearInterval(elapsedTimer.current); elapsedTimer.current = null; }
+  }, []);
+
+  const fmtElapsed = (s) => {
+    if (s < 60) return `${s}s`;
+    return `${Math.floor(s / 60)}m ${s % 60}s`;
+  };
+
+  /* ── Progress label ── */
+  const phaseMap = {
+    queued:      'Queued…',
+    prefetch:    'Fetching student photos',
+    render:      'Rendering ID cards',
+    writing:     'Compacting PDF',
+    downloading: 'Downloading',
+    done:        'Done',
+    error:       'Error',
+  };
 
   const generationProgressLabel = (() => {
-    if (cardLoading === 'all_dl')       return 'Generating PDF for all students…';
-    if (cardLoading === 'all_view')     return 'Preparing preview for all students…';
-    if (cardLoading?.endsWith('_dl'))   return `Generating Class ${cardLoading.replace('_dl', '')} PDF…`;
-    if (cardLoading?.endsWith('_view')) return `Preparing Class ${cardLoading.replace('_view', '')} preview…`;
-    if (studentLoading === 'download')  return 'Generating individual student card…';
-    if (studentLoading === 'view')      return 'Preparing student preview…';
-    return '';
+    if (!cardLoading && !studentLoading) return '';
+    const phaseStr = phaseMap[genPhase] || genPhase || '';
+    const pctStr   = genProgress > 0 ? ` — ${genProgress}%` : '';
+    const elapsed  = elapsedSecs > 0 ? ` (${fmtElapsed(elapsedSecs)})` : '';
+    if (genLabel) return `${genLabel}${phaseStr ? ` · ${phaseStr}` : ''}${pctStr}${elapsed}`;
+    if (studentLoading === 'download') return `Generating individual card${elapsed}`;
+    if (studentLoading === 'view')     return `Preparing preview${elapsed}`;
+    return `${phaseStr}${pctStr}${elapsed}`;
   })();
 
   /* ── Boot ── */
   const refreshStatus = useCallback(() => {
     axios.get(`${API}/status`).then((r) => {
       setBackendOk(true);
-      setStatus({ ...INITIAL_STATUS, ...r.data, classCounts: r.data?.classCounts || r.data?.class_counts || {} });
+      if (r.data && r.data.loaded) {
+        setStatus({
+          ...INITIAL_STATUS,
+          ...r.data,
+          classCounts: r.data?.classCounts || r.data?.class_counts || {},
+        });
+      }
     }).catch(() => setBackendOk(false));
   }, []);
+
+  // Removed the 60-second fixed ping interval — it was causing
+  // a React state update mid-download that triggered cleanup/DELETE
+  // on the active job before the file could be fetched.
 
   useEffect(() => {
     refreshStatus();
@@ -438,11 +456,10 @@ export default function App() {
     fd.append('file', file);
     try {
       const { data } = await axios.post(`${API}/upload`, fd);
-      handleSuccessfulLoad(data, 'file', data.school_name || file.name);
+      handleSuccessfulLoad(data, 'file', 'Uploaded File');
       addToast(`Imported ${data.count} students across ${(data.classes || []).length} classes`, 'success', 5000);
     } catch (err) {
-      const msg = err.response?.data?.error || err.message || 'Upload failed';
-      addToast(msg, 'error', 7000);
+      addToast(err.response?.data?.error || 'Upload failed', 'error');
     } finally { setUploadingFile(false); }
   };
 
@@ -451,7 +468,6 @@ export default function App() {
     setFetchingAPI(true);
     try {
       const { data } = await axios.get(`${API}/fetch-school/${selectedSchool}`);
-      if (data.school_id) setSchoolId(data.school_id);
       handleSuccessfulLoad(data, 'api', data.school);
       addToast(`Fetched ${data.count} students from ${data.school}`, 'success', 5000);
     } catch (err) {
@@ -462,116 +478,276 @@ export default function App() {
   /* ── PDF actions ── */
   const registerDone = useCallback(() => setGenerationDone(true), []);
 
-  const cancelDownload = useCallback(() => {
-    if (xhrRef.current) { try { xhrRef.current.abort(); } catch (_) {} xhrRef.current = null; }
-    setDlProgress(null); setCardLoading(null);
-    addToast('Download cancelled', 'info');
-  }, [addToast]);
+  /**
+   * downloadPDF — uses the /api/jobs/* async flow.
+   *
+   * FIX 1: No hard timeout on the poll loop — we rely only on the backend
+   *         to complete or error. Frontend just waits.
+   * FIX 2: Consecutive-error threshold raised from 40 to 90 (63 seconds of
+   *         blips at 700ms poll interval) before giving up.
+   * FIX 3: File download uses a 30-min axios timeout (was 15).
+   * FIX 4: Wall-clock elapsed counter shown to the user.
+   * FIX 5: We guard against double-click re-entry with activeJobId ref.
+   */
+  const downloadPDF = async (cls = null) => {
+    // prevent double-click while a job is running
+    if (cardLoading) return;
 
-  const downloadPDF = (cls = null) => {
     const key   = cls ? `${cls}_dl` : 'all_dl';
-    const fname = cls ? `ids_${selectedTemplate}_${cls}.pdf` : `ids_${selectedTemplate}_ALL.pdf`;
-    const url   = cls ? withTemplate(`${API}/download/all`, { class: cls }) : withTemplate(`${API}/download/all`);
+    const count = cls ? (status.classCounts?.[cls] ?? 0) : (status.count ?? 0);
+    const label = cls ? `Class ${cls}` : 'All students';
+
     setCardLoading(key);
-    setDlProgress({ pct: 0, detail: 'Starting…', eta: null, label: fname });
-    if (xhrRef.current) { try { xhrRef.current.abort(); } catch (_) {} }
-    const xhr = new XMLHttpRequest();
-    xhrRef.current = xhr;
-    xhr.open('GET', url, true);
-    xhr.responseType = 'blob';
-    xhr.withCredentials = false;
-    xhr.setRequestHeader('Accept', 'application/pdf,*/*');
-    xhr.setRequestHeader('X-Session-ID', SESSION_ID);
-    const t0 = Date.now();
-    xhr.onprogress = (e) => {
-      const mb = (n) => (n / (1024 * 1024)).toFixed(1);
-      if (e.lengthComputable && e.total > 0) {
-        const pct  = Math.round((e.loaded / e.total) * 100);
-        const secs = (Date.now() - t0) / 1000;
-        const rem  = secs > 0 ? (e.total - e.loaded) / (e.loaded / secs) : null;
-        const eta  = rem != null ? (rem < 60 ? `${Math.ceil(rem)}s left` : `${Math.ceil(rem / 60)}m left`) : null;
-        setDlProgress({ pct, detail: `${mb(e.loaded)} / ${mb(e.total)} MB`, eta, label: fname });
-      } else {
-        setDlProgress((p) => ({ ...(p || {}), pct: -1, detail: `${mb(e.loaded)} MB downloaded…`, eta: null, label: fname }));
+    setGenProgress(0);
+    setGenPhase('queued');
+    setGenLabel(label);
+    startElapsed();
+
+    let jobId     = null;
+    let pollTimer = null;
+
+    try {
+      // 1) Start the background job
+      const startUrl = cls
+        ? `${API}/jobs/start?class=${encodeURIComponent(cls)}&template=${encodeURIComponent(selectedTemplate)}`
+        : `${API}/jobs/start?template=${encodeURIComponent(selectedTemplate)}`;
+
+      jobDoneRef.current = false;
+
+      let startResp;
+      try {
+        startResp = await axios.post(startUrl, null);
+      } catch (e) {
+        // Some hosts block POST on non-form endpoints — fall back to GET
+        startResp = await axios.get(startUrl);
       }
-    };
-    xhr.onload = () => {
-      setDlProgress(null); setCardLoading(null); xhrRef.current = null;
-      if (xhr.status >= 200 && xhr.status < 300) {
-        const ct = (xhr.getResponseHeader('Content-Type') || '').toLowerCase();
-        if (ct.includes('application/json')) {
-          const reader = new FileReader();
-          reader.onload = () => {
-            try {
-              const p = JSON.parse(reader.result);
-              if (p.download_url) { window.open(p.download_url, '_blank', 'noopener,noreferrer'); registerDone(); addToast('PDF opened from cloud storage', 'success'); }
-              else addToast(p.error || 'Download failed', 'error');
-            } catch (_) { addToast('Download failed', 'error'); }
-          };
-          reader.readAsText(xhr.response);
-          return;
+
+      const startData = startResp.data || {};
+      if (startData.error) throw new Error(startData.error);
+      jobId = startData.job_id;
+      activeJobId.current = jobId;
+
+      const fname = startData.download_name ||
+                    (cls ? `ids_${selectedTemplate}_${cls}.pdf` : `ids_${selectedTemplate}_ALL.pdf`);
+
+      // 2) Poll progress — NO hard timeout. Wait as long as the server needs.
+      //    Only bail if we see a long run of consecutive network errors.
+      let consecutiveErrors = 0;
+      const MAX_CONSECUTIVE_ERRORS = 200; // ~140s of blips at 700ms intervals
+
+      await new Promise((resolve, reject) => {
+        pollTimer = window.setInterval(async () => {
+          try {
+            const { data } = await axios.get(
+              `${API}/jobs/${jobId}/progress`,
+            );
+            consecutiveErrors = 0;
+            setGenProgress(Math.min(99, Math.round(data.progress || 0)));
+            setGenPhase(data.phase || '');
+
+            if (data.status === 'done') {
+              jobDoneRef.current = true;
+              window.clearInterval(pollTimer);
+              pollTimer = null;
+              resolve();
+            }
+            if (data.status === 'error') {
+              window.clearInterval(pollTimer);
+              pollTimer = null;
+              reject(new Error(data.error || 'PDF generation failed on server'));
+            }
+          } catch {
+            consecutiveErrors += 1;
+            if (consecutiveErrors > MAX_CONSECUTIVE_ERRORS) {
+              window.clearInterval(pollTimer);
+              pollTimer = null;
+              reject(new Error(
+                'Lost connection to server for >2 minutes while waiting. ' +
+                'The PDF may still be generating — please check back or retry.'
+              ));
+            }
+          }
+        }, 700);
+      });
+
+      // 3) Download the finished file
+      setGenPhase('downloading');
+      const fileUrl = `${API}/jobs/${jobId}/file`;
+
+      let resp = null;
+      // Retry once on transient gateway errors (502/503/504)
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          resp = await axios.get(fileUrl, {
+            responseType: 'blob',
+            timeout: 30 * 60 * 1000,   // 30-min cap — more than enough for any batch
+          });
+          break;
+        } catch (e) {
+          const sc = e?.response?.status;
+          if (attempt === 1 && (!sc || sc === 502 || sc === 503 || sc === 504)) {
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
+          }
+          throw e;
         }
-        const blobUrl = URL.createObjectURL(xhr.response);
-        const a = document.createElement('a');
-        a.href = blobUrl; a.download = fname;
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
-        registerDone();
-        addToast(`✓ ${fname} downloaded`, 'success');
-      } else {
-        const reader = new FileReader();
-        reader.onload = () => {
-          try { const p = JSON.parse(reader.result); addToast(p.error || `Download failed (${xhr.status})`, 'error'); }
-          catch (_) { addToast(`Download failed (${xhr.status})`, 'error'); }
-        };
-        reader.onerror = () => addToast(`Download failed (${xhr.status})`, 'error');
-        reader.readAsText(xhr.response);
       }
-    };
-    xhr.onerror = () => { setDlProgress(null); setCardLoading(null); xhrRef.current = null; addToast('Network error — download failed', 'error'); };
-    xhr.onabort = () => { setDlProgress(null); setCardLoading(null); xhrRef.current = null; };
-    xhr.send();
+
+      setGenProgress(100);
+      await openExternalOrBlob(resp, fname);
+      activeJobId.current = null;
+      registerDone();
+      stopElapsed();
+      addToast(`PDF downloaded (${fmtElapsed(elapsedSecs)})`, 'success');
+    } catch (err) {
+      console.error('downloadPDF error:', err?.response?.status, err?.response?.data, err?.message);
+      let msg = err?.response?.data?.error || err?.message || 'Download failed';
+      if (!err?.response && /network|failed|timeout/i.test(err?.message || '')) {
+        msg = `${msg} — The server may still be working. Wait and try again.`;
+      }
+      addToast(msg, 'error', 8000);
+      // Only cancel on server if the job never completed — if it's done the
+      // file endpoint handles its own cleanup after streaming.
+      if (jobId && !jobDoneRef.current) {
+        axios.delete(`${API}/jobs/${jobId}`).catch(() => {});
+        activeJobId.current = null;
+      }
+    } finally {
+      if (pollTimer) window.clearInterval(pollTimer);
+      setCardLoading(null);
+      setGenProgress(0);
+      setGenPhase('');
+      setGenLabel('');
+      stopElapsed();
+    }
   };
 
+  /**
+   * viewPDF — uses jobs API for large batches too (avoids the old 5-min
+   * streaming timeout that was causing the "error" on 488 students).
+   * For previews we still use the direct /api/preview/all route but cap
+   * at 100 students.  For viewing a specific class, if the class is small
+   * (<= 50 students) we use direct preview; otherwise jobs flow.
+   */
   const viewPDF = async (cls = null) => {
-    const key = cls ? `${cls}_view` : 'all_view';
+    const key   = cls ? `${cls}_view` : 'all_view';
+    const count = cls ? (status.classCounts?.[cls] ?? 0) : (status.count ?? 0);
+
     setCardLoading(key);
+    setGenProgress(0);
+    setGenPhase('queued');
+    setGenLabel(cls ? `Preview Class ${cls}` : 'Preview all');
+    startElapsed();
+
     try {
-      const url  = cls ? withTemplate(`${API}/preview/all`, { class: cls }) : withTemplate(`${API}/preview/all`);
-      const resp = await axios.get(url, { responseType: 'blob' });
-      await openExternalOrBlob(resp, 'preview.pdf', (u, ext) => {
-        setModal({ url: u, title: cls ? `Class ${cls} — Preview` : 'All Students — Preview', external: ext });
-      });
-      registerDone();
+      // For large classes / all-students, use the jobs flow to avoid timeout
+      const useJobsFlow = count > 50;
+
+      if (useJobsFlow) {
+        // Kick off job
+        const startUrl = cls
+          ? `${API}/jobs/start?class=${encodeURIComponent(cls)}&template=${encodeURIComponent(selectedTemplate)}`
+          : `${API}/jobs/start?template=${encodeURIComponent(selectedTemplate)}`;
+
+        let startResp;
+        try {
+          startResp = await axios.post(startUrl, null);
+        } catch {
+          startResp = await axios.get(startUrl);
+        }
+
+        const startData = startResp.data || {};
+        if (startData.error) throw new Error(startData.error);
+        const jobId = startData.job_id;
+        activeJobId.current = jobId;
+        jobDoneRef.current = false;
+
+        // Poll
+        let consecutiveErrors = 0;
+        await new Promise((resolve, reject) => {
+          const t = window.setInterval(async () => {
+            try {
+              const { data } = await axios.get(`${API}/jobs/${jobId}/progress`);
+              consecutiveErrors = 0;
+              setGenProgress(Math.min(99, Math.round(data.progress || 0)));
+              setGenPhase(data.phase || '');
+              if (data.status === 'done')  { jobDoneRef.current = true; window.clearInterval(t); resolve(); }
+              if (data.status === 'error') { window.clearInterval(t); reject(new Error(data.error || 'PDF generation failed')); }
+            } catch {
+              consecutiveErrors += 1;
+              if (consecutiveErrors > 200) { window.clearInterval(t); reject(new Error('Connection lost while polling')); }
+            }
+          }, 700);
+        });
+
+        setGenPhase('downloading');
+        const resp = await axios.get(`${API}/jobs/${jobId}/file`, {
+          responseType: 'blob',
+          timeout: 30 * 60 * 1000,
+        });
+        setGenProgress(100);
+        await openExternalOrBlob(resp, 'preview.pdf', (u, ext) => {
+          setModal({ url: u, title: cls ? `Class ${cls} — Preview` : 'All Students — Preview', external: ext });
+        });
+        activeJobId.current = null;
+        registerDone();
+      } else {
+        // Small class — direct streaming route is fine
+        const url = cls
+          ? withTemplate(`${API}/preview/all`, { class: cls })
+          : withTemplate(`${API}/preview/all`);
+        const resp = await axios.get(url, {
+          responseType: 'blob',
+          timeout: 10 * 60 * 1000,   // 10-min — generous for small classes
+        });
+        await openExternalOrBlob(resp, 'preview.pdf', (u, ext) => {
+          setModal({ url: u, title: cls ? `Class ${cls} — Preview` : 'All Students — Preview', external: ext });
+        });
+        registerDone();
+      }
     } catch (err) {
-      console.error('[DEBUG] viewPDF ERROR:', err?.response?.status, err?.message);
-      addToast(err.response?.data?.error || 'Preview failed', 'error');
-    } finally { setCardLoading(null); }
+      addToast(err?.response?.data?.error || err?.message || 'Preview failed', 'error', 6000);
+    } finally {
+      setCardLoading(null);
+      setGenProgress(0);
+      setGenPhase('');
+      setGenLabel('');
+      stopElapsed();
+    }
   };
 
   const viewStudent = async () => {
     if (!studentClass || !studentName) { addToast('Select class and student', 'error'); return; }
     setStudentLoading('view');
+    startElapsed();
     try {
-      const resp = await axios.get(withTemplate(`${API}/preview/student`, { class: studentClass, name: studentName }), { responseType: 'blob' });
-      await openExternalOrBlob(resp, 'preview_student.pdf', (u, ext) => setModal({ url: u, title: `${studentName} — Preview`, external: ext }));
+      const resp = await axios.get(
+        withTemplate(`${API}/preview/student`, { class: studentClass, name: studentName }),
+        { responseType: 'blob', timeout: 10 * 60 * 1000 },
+      );
+      await openExternalOrBlob(resp, 'preview_student.pdf', (u, ext) =>
+        setModal({ url: u, title: `${studentName} — Preview`, external: ext }));
       registerDone();
     } catch (err) {
       addToast(err.response?.data?.error || 'Preview failed', 'error');
-    } finally { setStudentLoading(null); }
+    } finally { setStudentLoading(null); stopElapsed(); }
   };
 
   const downloadStudent = async () => {
     if (!studentClass || !studentName) { addToast('Select class and student', 'error'); return; }
     setStudentLoading('download');
+    startElapsed();
     try {
-      const resp = await axios.get(withTemplate(`${API}/download/student`, { class: studentClass, name: studentName }), { responseType: 'blob' });
+      const resp = await axios.get(
+        withTemplate(`${API}/download/student`, { class: studentClass, name: studentName }),
+        { responseType: 'blob', timeout: 10 * 60 * 1000 },
+      );
       const result = await openExternalOrBlob(resp, `id_${selectedTemplate}_${studentName.replace(/\s+/g, '_')}.pdf`);
       registerDone();
       addToast(result.external ? 'Card opened from cloud storage' : 'Card downloaded', 'success');
     } catch (err) {
       addToast(err.response?.data?.error || 'Download failed', 'error');
-    } finally { setStudentLoading(null); }
+    } finally { setStudentLoading(null); stopElapsed(); }
   };
 
   const closeModal = () => {
@@ -580,16 +756,22 @@ export default function App() {
   };
 
   const confirmTemplate = () => {
-    console.log('[DEBUG] confirmTemplate | selectedTemplate =', selectedTemplate, '| activeTemplate =', activeTemplate?.key, activeTemplate?.label);
     setTemplateConfirmed(true);
     setActiveStep(1);
     addToast(`Template set: ${activeTemplate?.label}`, 'success');
   };
 
   const resetWorkflow = () => {
+    // cancel any running job
+    if (activeJobId.current) {
+      axios.delete(`${API}/jobs/${activeJobId.current}`).catch(() => {});
+      activeJobId.current = null;
+    }
+    stopElapsed();
     setStatus(INITIAL_STATUS); setTemplateConfirmed(false); setSelectedSchool('');
     setDataSource('file'); setStudentClass(''); setStudentName(''); setStudentNames([]);
     setSearchQuery(''); setShowAdvanced(false); setGenerationDone(false); setActiveStep(0);
+    setCardLoading(null); setGenProgress(0); setGenPhase(''); setGenLabel('');
     addToast('Workflow reset', 'info');
   };
 
@@ -611,7 +793,6 @@ export default function App() {
   return (
     <div className="app-shell">
       <Toast toasts={toasts} removeToast={removeToast} />
-      <DownloadProgress progress={dlProgress} onCancel={cancelDownload} />
       {modal && <PDFModal url={modal.url} title={modal.title} external={modal.external} onClose={closeModal} />}
 
       {/* ── Top bar ── */}
@@ -817,23 +998,59 @@ export default function App() {
               <div className="gen-hero">
                 <div>
                   <h3>Export all student ID cards</h3>
-                  <p>Download or preview the full batch using the <strong>{activeTemplate?.label}</strong> template</p>
+                  <p>
+                    Download the full batch using <strong>{activeTemplate?.label}</strong> template
+                    {status.count > 0 && (
+                      <span style={{ color: 'var(--text-3)', marginLeft: 6 }}>
+                        · Est. {estimateTime(status.count, selectedTemplate)} on prod server
+                      </span>
+                    )}
+                  </p>
                 </div>
                 <div className="gen-actions">
-                  <button className="btn btn-primary btn-lg" onClick={() => downloadPDF(null)} disabled={!!cardLoading || !!studentLoading}>
-                    {cardLoading === 'all_dl' ? <><span className="btn-spinner" /> Generating…</> : <><Download size={15} /> Download all</>}
+                  <button
+                    className="btn btn-primary btn-lg"
+                    onClick={() => downloadPDF(null)}
+                    disabled={!!cardLoading || !!studentLoading}
+                  >
+                    {cardLoading === 'all_dl'
+                      ? <><span className="btn-spinner" /> Generating…</>
+                      : <><Download size={15} /> Download all</>}
                   </button>
-                  <button className="btn btn-secondary btn-lg" onClick={() => viewPDF(null)} disabled={!!cardLoading || !!studentLoading}>
-                    {cardLoading === 'all_view' ? <><span className="btn-spinner" /> Loading…</> : <><Eye size={15} /> Preview all</>}
+                  <button
+                    className="btn btn-secondary btn-lg"
+                    onClick={() => viewPDF(null)}
+                    disabled={!!cardLoading || !!studentLoading}
+                  >
+                    {cardLoading === 'all_view'
+                      ? <><span className="btn-spinner" /> Loading…</>
+                      : <><Eye size={15} /> Preview all</>}
                   </button>
                 </div>
               </div>
 
-              {/* Progress / large batch notice */}
-              {(generationProgressLabel || isLargeBatch) && (
+              {/* Progress bar — shown whenever any generation is running */}
+              {(cardLoading || studentLoading) && (
                 <div className="status-banner">
-                  {generationProgressLabel ? <Loader2 size={15} className="spin-icon" /> : <AlertCircle size={15} />}
-                  <span>{generationProgressLabel || 'Large batch — preview mode recommended for reliability.'}</span>
+                  <Loader2 size={15} className="spin-icon" />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ marginBottom: 4 }}>{generationProgressLabel}</div>
+                    {genProgress > 0 && (
+                      <div style={{
+                        height: 7, width: '100%',
+                        background: 'rgba(0,0,0,0.08)',
+                        borderRadius: 999, overflow: 'hidden',
+                      }}>
+                        <div style={{
+                          width: `${genProgress}%`,
+                          height: '100%',
+                          background: 'var(--primary, #4F46E5)',
+                          transition: 'width 300ms ease',
+                          borderRadius: 999,
+                        }} />
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -899,10 +1116,10 @@ export default function App() {
                     </div>
                   </div>
                   <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                    <button className="btn btn-secondary" onClick={viewStudent} disabled={!studentName || !!studentLoading}>
+                    <button className="btn btn-secondary" onClick={viewStudent} disabled={!studentName || !!studentLoading || !!cardLoading}>
                       {studentLoading === 'view' ? <><span className="btn-spinner" /> Loading…</> : <><Eye size={14} /> Preview</>}
                     </button>
-                    <button className="btn btn-primary" onClick={downloadStudent} disabled={!studentName || !!studentLoading}>
+                    <button className="btn btn-primary" onClick={downloadStudent} disabled={!studentName || !!studentLoading || !!cardLoading}>
                       {studentLoading === 'download' ? <><span className="btn-spinner" /> Generating…</> : <><Download size={14} /> Download</>}
                     </button>
                   </div>
