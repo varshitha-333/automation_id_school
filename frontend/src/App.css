@@ -1080,3 +1080,94 @@ code {
   .gen-hero { flex-direction: column; align-items: flex-start; }
   .step-label { display: none; }
 }
+/* ────────────────────────────────────────
+   DOWNLOAD PROGRESS PILL
+   ──────────────────────────────────────── */
+.dl-progress-overlay {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  width: min(480px, calc(100vw - 32px));
+}
+.dl-progress-pill {
+  background: #1E293B;
+  color: #F8FAFC;
+  border-radius: 16px;
+  padding: 14px 18px 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.35), 0 2px 8px rgba(0,0,0,.2);
+  animation: dlPillIn .25s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes dlPillIn {
+  from { opacity:0; transform:translateY(20px) scale(.95); }
+  to   { opacity:1; transform:translateY(0)    scale(1);   }
+}
+.dl-progress-top {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 10px;
+}
+.dl-progress-icon {
+  color: #818CF8;
+  flex-shrink: 0;
+  animation: dlBob 1.4s ease-in-out infinite;
+}
+@keyframes dlBob {
+  0%,100% { transform:translateY(0); }
+  50%      { transform:translateY(3px); }
+}
+.dl-progress-info { flex:1; min-width:0; }
+.dl-progress-label {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #F1F5F9;
+}
+.dl-progress-detail { font-size:11.5px; color:#94A3B8; margin-top:1px; }
+.dl-progress-pct {
+  font-size: 15px;
+  font-weight: 700;
+  color: #818CF8;
+  flex-shrink: 0;
+  min-width: 38px;
+  text-align: right;
+}
+.dl-progress-cancel {
+  background: none;
+  border: none;
+  color: #64748B;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  transition: color .15s, background .15s;
+}
+.dl-progress-cancel:hover { color:#F87171; background:rgba(248,113,113,.12); }
+.dl-progress-bar-track {
+  height: 5px;
+  background: #334155;
+  border-radius: 99px;
+  overflow: hidden;
+}
+.dl-progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg,#6366F1,#818CF8);
+  border-radius: 99px;
+  transition: width .3s ease;
+}
+.dl-progress-bar-indeterminate {
+  height: 100%;
+  width: 40%;
+  background: linear-gradient(90deg,transparent,#818CF8,transparent);
+  border-radius: 99px;
+  animation: dlIndet 1.5s ease-in-out infinite;
+}
+@keyframes dlIndet {
+  0%   { transform:translateX(-150%); }
+  100% { transform:translateX(350%); }
+}
