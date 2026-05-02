@@ -36,8 +36,23 @@ const normalizeApiBase = (rawValue) => {
 const API        = normalizeApiBase(process.env.REACT_APP_API_URL || '/api');
 const API_ORIGIN = (process.env.REACT_APP_API_URL || '').replace(/\/+$/, '');
 
-// Send session cookie on every request so Flask knows which session we're in
-axios.defaults.withCredentials = true;
+// ── Persistent session ID ─────────────────────────────────────────
+// Stored in localStorage so it survives page refreshes.
+// Sent as X-Session-ID header on every request — avoids ALL cookie/SameSite issues.
+const _getOrCreateSessionId = () => {
+  try {
+    let sid = localStorage.getItem('idcard_session_id');
+    if (!sid || sid.length < 16) {
+      sid = crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '') : Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem('idcard_session_id', sid);
+    }
+    return sid;
+  } catch (_) {
+    return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+};
+const SESSION_ID = _getOrCreateSessionId();
+axios.defaults.headers.common['X-Session-ID'] = SESSION_ID;
 
 /* ─── Fallback templates ──────────────────────────────────── */
 const TEMPLATE_COLORS = {
@@ -423,10 +438,11 @@ export default function App() {
     fd.append('file', file);
     try {
       const { data } = await axios.post(`${API}/upload`, fd);
-      handleSuccessfulLoad(data, 'file', 'Uploaded File');
+      handleSuccessfulLoad(data, 'file', data.school_name || file.name);
       addToast(`Imported ${data.count} students across ${(data.classes || []).length} classes`, 'success', 5000);
     } catch (err) {
-      addToast(err.response?.data?.error || 'Upload failed', 'error');
+      const msg = err.response?.data?.error || err.message || 'Upload failed';
+      addToast(msg, 'error', 7000);
     } finally { setUploadingFile(false); }
   };
 
@@ -463,8 +479,9 @@ export default function App() {
     xhrRef.current = xhr;
     xhr.open('GET', url, true);
     xhr.responseType = 'blob';
-    xhr.withCredentials = true;
+    xhr.withCredentials = false;
     xhr.setRequestHeader('Accept', 'application/pdf,*/*');
+    xhr.setRequestHeader('X-Session-ID', SESSION_ID);
     const t0 = Date.now();
     xhr.onprogress = (e) => {
       const mb = (n) => (n / (1024 * 1024)).toFixed(1);
@@ -521,7 +538,7 @@ export default function App() {
     setCardLoading(key);
     try {
       const url  = cls ? withTemplate(`${API}/preview/all`, { class: cls }) : withTemplate(`${API}/preview/all`);
-      const resp = await axios.get(url, { responseType: 'blob', withCredentials: true });
+      const resp = await axios.get(url, { responseType: 'blob' });
       await openExternalOrBlob(resp, 'preview.pdf', (u, ext) => {
         setModal({ url: u, title: cls ? `Class ${cls} — Preview` : 'All Students — Preview', external: ext });
       });
