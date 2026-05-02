@@ -25,6 +25,32 @@ import {
 } from 'lucide-react';
 import './App.css';
 
+/* ─── Restart banner CSS (injected once) ─────────────────── */
+const RESTART_BANNER_CSS = `
+.restart-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  background: #FEF3C7;
+  border-bottom: 2px solid #F59E0B;
+  color: #92400E;
+  font-size: 13px;
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  z-index: 200;
+}
+.restart-banner svg { flex-shrink: 0; color: #D97706; }
+.restart-banner span { flex: 1; }
+`;
+if (typeof document !== 'undefined' && !document.getElementById('restart-banner-style')) {
+  const s = document.createElement('style');
+  s.id = 'restart-banner-style';
+  s.textContent = RESTART_BANNER_CSS;
+  document.head.appendChild(s);
+}
+
 /* ─── API helpers ─────────────────────────────────────────── */
 const normalizeApiBase = (rawValue) => {
   const value = (rawValue || '').trim();
@@ -86,6 +112,21 @@ const FALLBACK_TEMPLATES = [
 const INITIAL_STATUS = { loaded: false, count: 0, classes: [], classCounts: {} };
 
 /* ─── Utilities ───────────────────────────────────────────── */
+
+/**
+ * When axios uses responseType:'blob', error responses (400, 500…) ALSO
+ * arrive as Blobs. We must read them back to surface a useful error message.
+ */
+const readBlobError = async (blob) => {
+  try {
+    const text = await (blob instanceof Blob ? blob : new Blob([blob])).text();
+    const parsed = JSON.parse(text);
+    return parsed.error || parsed.message || text || 'Server error';
+  } catch {
+    return 'No students loaded — please reload student data and try again';
+  }
+};
+
 const openExternalOrBlob = async (resp, fallbackName, onPreview) => {
   const contentType = (resp.headers?.['content-type'] || resp.data?.type || '').toLowerCase();
   if (contentType.includes('application/json')) {
@@ -164,7 +205,7 @@ function Select({ value, onChange, options, placeholder, disabled }) {
   );
 }
 
-/* ─── Loading dots ──────────────────────────────────────────___ */
+/* ─── Loading dots ────────────────────────────────────────── */
 function Dots() {
   return <span className="loading-dots"><span /><span /><span /></span>;
 }
@@ -277,6 +318,7 @@ export default function App() {
   const [studentNames, setStudentNames]         = useState([]);
   const [studentLoading, setStudentLoading]     = useState(null);
   const [backendOk, setBackendOk]               = useState(null);
+  const [backendWasLost, setBackendWasLost]     = useState(false); // backend restarted while page was open
   const [activeStep, setActiveStep]             = useState(0);
   const [searchQuery, setSearchQuery]           = useState('');
   const [showAdvanced, setShowAdvanced]         = useState(false);
@@ -336,10 +378,20 @@ export default function App() {
   /* ── Boot ── */
   const refreshStatus = useCallback(() => {
     axios.get(`${API}/status`).then((r) => {
+      const wasOffline = backendOk === false;
       setBackendOk(true);
-      setStatus({ ...INITIAL_STATUS, ...r.data, classCounts: r.data?.classCounts || r.data?.class_counts || {} });
-    }).catch(() => setBackendOk(false));
-  }, []);
+      const newStatus = { ...INITIAL_STATUS, ...r.data, classCounts: r.data?.classCounts || r.data?.class_counts || {} };
+      setStatus((prev) => {
+        // Backend restarted and wiped its in-memory store while we had data loaded
+        if (wasOffline && prev.loaded && !newStatus.loaded) {
+          setBackendWasLost(true);
+        }
+        return newStatus;
+      });
+    }).catch(() => {
+      setBackendOk(false);
+    });
+  }, [backendOk]);
 
   useEffect(() => {
     refreshStatus();
@@ -357,6 +409,12 @@ export default function App() {
       setTemplates(list);
       setSelectedTemplate((prev) => list.some((t) => t.key === prev) ? prev : list[0]?.key || 'redeemer');
     }).catch(() => setTemplates(FALLBACK_TEMPLATES)).finally(() => setLoadingTemplates(false));
+  }, [refreshStatus]);
+
+  /* ── Heartbeat: poll /api/status every 8 s to detect backend restart ── */
+  useEffect(() => {
+    const timer = setInterval(refreshStatus, 8000);
+    return () => clearInterval(timer);
   }, [refreshStatus]);
 
   useEffect(() => {
@@ -424,8 +482,11 @@ export default function App() {
       registerDone();
       addToast(result.external ? 'PDF opened from cloud storage' : 'PDF downloaded', 'success');
     } catch (err) {
-      console.error('[DEBUG] downloadPDF ERROR:', err?.response?.status, err?.response?.data, err?.message);
-      addToast(err.response?.data?.error || 'Download failed', 'error');
+      console.error('[DEBUG] downloadPDF ERROR:', err?.response?.status, err?.message);
+      const msg = err?.response?.data
+        ? await readBlobError(err.response.data)
+        : (err?.message?.includes('Network') ? 'Backend offline — restart Flask and reload data' : 'Download failed');
+      addToast(msg, 'error', 7000);
     } finally { setCardLoading(null); }
   };
 
@@ -444,7 +505,10 @@ export default function App() {
       registerDone();
     } catch (err) {
       console.error('[DEBUG] viewPDF ERROR:', err?.response?.status, err?.message);
-      addToast(err.response?.data?.error || 'Preview failed', 'error');
+      const msg = err?.response?.data
+        ? await readBlobError(err.response.data)
+        : (err?.message?.includes('Network') ? 'Backend offline — restart Flask and reload data' : 'Preview failed');
+      addToast(msg, 'error', 7000);
     } finally { setCardLoading(null); }
   };
 
@@ -456,7 +520,10 @@ export default function App() {
       await openExternalOrBlob(resp, 'preview_student.pdf', (u, ext) => setModal({ url: u, title: `${studentName} — Preview`, external: ext }));
       registerDone();
     } catch (err) {
-      addToast(err.response?.data?.error || 'Preview failed', 'error');
+      const msg = err?.response?.data
+        ? await readBlobError(err.response.data)
+        : 'Preview failed — check backend is running';
+      addToast(msg, 'error', 7000);
     } finally { setStudentLoading(null); }
   };
 
@@ -469,7 +536,10 @@ export default function App() {
       registerDone();
       addToast(result.external ? 'Card opened from cloud storage' : 'Card downloaded', 'success');
     } catch (err) {
-      addToast(err.response?.data?.error || 'Download failed', 'error');
+      const msg = err?.response?.data
+        ? await readBlobError(err.response.data)
+        : 'Download failed — check backend is running';
+      addToast(msg, 'error', 7000);
     } finally { setStudentLoading(null); }
   };
 
@@ -511,6 +581,25 @@ export default function App() {
     <div className="app-shell">
       <Toast toasts={toasts} removeToast={removeToast} />
       {modal && <PDFModal url={modal.url} title={modal.title} external={modal.external} onClose={closeModal} />}
+
+      {/* ── Stale-data warning: shown when backend restarted and wiped student data ── */}
+      {backendWasLost && (
+        <div className="restart-banner">
+          <AlertCircle size={15} />
+          <span>
+            <strong>Backend was restarted</strong> — student data was cleared.
+            Please re-upload your file or re-fetch from the API before downloading.
+          </span>
+          <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+            <button className="btn btn-primary btn-sm" onClick={() => { setBackendWasLost(false); setActiveStep(1); }}>
+              Reload data →
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={() => setBackendWasLost(false)}>
+              <X size={13} />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Top bar ── */}
       <header className="topbar">
