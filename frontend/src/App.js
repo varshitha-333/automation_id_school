@@ -164,7 +164,7 @@ function Select({ value, onChange, options, placeholder, disabled }) {
   );
 }
 
-/* ─── Loading dots ────────────────────────────────────────── */
+/* ─── Loading dots ──────────────────────────────────────────___ */
 function Dots() {
   return <span className="loading-dots"><span /><span /><span /></span>;
 }
