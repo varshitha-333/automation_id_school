@@ -11,10 +11,6 @@
   ],
   "routes": [
     {
-      "src": "/api/(.*)",
-      "dest": "https://web-production-830f42.up.railway.app/api/$1"
-    },
-    {
       "src": "/(.*)",
       "dest": "/frontend/$1"
     }
