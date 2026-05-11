@@ -46,12 +46,18 @@ const API_ORIGIN = (process.env.REACT_APP_API_URL || '').replace(/\/+$/, '');
 
 axios.defaults.headers.common['X-Requested-With'] = 'XMLHttpRequest';
 
-/* ─── v3.1 SESSION TOKEN ──────────────────────────────────────
-   Every request the React app makes carries an X-Session-Token
-   header. The token is issued by POST /api/login (after the user
-   types the access code) and persisted in localStorage so a page
-   reload keeps the same seat. ─────────────────────────────────── */
+/* ─── v3.2 SESSION TOKEN + STABLE CLIENT ID ───────────────────
+   Every request carries:
+     X-Session-Token : per-login token (rotated each login)
+     X-Client-ID     : stable UUID stored permanently in localStorage
+                       — same browser always sends the same value, so
+                       the server can recycle our seat when we switch
+                       between WiFi and mobile data instead of giving
+                       us a fresh one (which would fill up the 2-seat
+                       cap with our own duplicate sessions).
+   ─────────────────────────────────────────────────────────── */
 const SESSION_KEY = 'idcard_session_token';
+const CLIENT_KEY  = 'idcard_client_id';
 
 function getStoredToken() {
   try { return localStorage.getItem(SESSION_KEY) || ''; }
@@ -64,14 +70,38 @@ function setStoredToken(tok) {
   } catch (_) { /* private-mode etc — fine, in-memory only */ }
 }
 
-// Inject the token onto every outgoing request. We use an interceptor
-// instead of a default header so we always pick up the LATEST token.
-axios.interceptors.request.use((config) => {
-  const tok = getStoredToken();
-  if (tok) {
-    config.headers = config.headers || {};
-    config.headers['X-Session-Token'] = tok;
+function getClientId() {
+  try {
+    let id = localStorage.getItem(CLIENT_KEY) || '';
+    if (!id) {
+      // RFC4122 v4 UUID (crypto-strong when available, fallback otherwise)
+      if (window.crypto && window.crypto.randomUUID) {
+        id = window.crypto.randomUUID();
+      } else {
+        id = 'xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+          const r = (Math.random() * 16) | 0;
+          const v = c === 'x' ? r : (r & 0x3) | 0x8;
+          return v.toString(16);
+        });
+      }
+      localStorage.setItem(CLIENT_KEY, id);
+    }
+    return id;
+  } catch (_) {
+    // localStorage blocked (private mode) — fall back to a per-tab id.
+    if (!window.__idcard_client_id) {
+      window.__idcard_client_id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
+    return window.__idcard_client_id;
   }
+}
+
+// Inject session token + client_id on every outgoing request.
+axios.interceptors.request.use((config) => {
+  config.headers = config.headers || {};
+  const tok = getStoredToken();
+  if (tok) config.headers['X-Session-Token'] = tok;
+  config.headers['X-Client-ID'] = getClientId();
   return config;
 });
 
@@ -351,9 +381,13 @@ function LoginScreen({ onSuccess, initialSeats }) {
     if (!code.trim() || busy) return;
     setBusy(true); setError('');
     try {
-      const resume = getStoredToken();
+      const resume    = getStoredToken();
+      const clientId  = getClientId();
       const { data } = await axios.post(`${API}/login`,
-        { code: code.trim(), resume_token: resume || undefined });
+        { code: code.trim(),
+          resume_token: resume || undefined,
+          client_id:    clientId },
+        { headers: { 'X-Client-ID': clientId } });
       if (data?.session_token) {
         setStoredToken(data.session_token);
         onSuccess(data);
@@ -585,14 +619,61 @@ export default function App() {
     return () => axios.interceptors.response.eject(id);
   }, []);
 
-  const handleLogout = useCallback(() => {
-    axios.post(`${API}/logout`).catch(() => {});
+  const handleLogout = useCallback(async () => {
+    const clientId = getClientId();
+    const tok      = getStoredToken();
+    // Fire the request and AWAIT it so the user sees the seat-count
+    // drop immediately. We also pass client_id in the body so the
+    // server kills any stale seat from a previous network.
+    try {
+      await axios.post(`${API}/logout`,
+        { client_id: clientId },
+        { headers: { 'X-Client-ID': clientId, 'X-Session-Token': tok || '' },
+          timeout: 8000 });
+    } catch (_) { /* ignore — we still clear locally */ }
     setStoredToken('');
     setAuthed(false);
     setSysStats(null);
     setStatus(INITIAL_STATUS);
     setActiveStep(0);
     setTemplateConfirmed(false);
+  }, []);
+
+  /* v3.2: when the tab is closed / browser is killed, fire a
+     sendBeacon to /api/logout so our seat is freed instantly
+     instead of waiting for the 15-min idle timer. sendBeacon
+     survives page-unload where axios.post would be cancelled. */
+  useEffect(() => {
+    const release = () => {
+      try {
+        const clientId = getClientId();
+        const tok      = getStoredToken();
+        const payload  = new Blob(
+          [JSON.stringify({ client_id: clientId, session_token: tok })],
+          { type: 'application/json' });
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon(`${API}/logout`, payload);
+        } else {
+          // Fallback for ancient browsers
+          fetch(`${API}/logout`, {
+            method: 'POST',
+            keepalive: true,
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Client-ID': clientId,
+              'X-Session-Token': tok || '',
+            },
+            body: JSON.stringify({ client_id: clientId }),
+          }).catch(() => {});
+        }
+      } catch (_) { /* swallow */ }
+    };
+    window.addEventListener('pagehide', release);
+    window.addEventListener('beforeunload', release);
+    return () => {
+      window.removeEventListener('pagehide', release);
+      window.removeEventListener('beforeunload', release);
+    };
   }, []);
 
   /* ── Derived ── */
