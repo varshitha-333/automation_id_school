@@ -22,6 +22,14 @@ import {
   RotateCcw,
   Wand2,
   CreditCard,
+  Lock,
+  KeyRound,
+  Cpu,
+  MemoryStick,
+  HardDrive,
+  Users,
+  LogOut,
+  ShieldAlert,
 } from 'lucide-react';
 import './App.css';
 
@@ -37,6 +45,45 @@ const API        = normalizeApiBase(process.env.REACT_APP_API_URL || '/api');
 const API_ORIGIN = (process.env.REACT_APP_API_URL || '').replace(/\/+$/, '');
 
 axios.defaults.headers.common['X-Requested-With'] = 'XMLHttpRequest';
+
+/* ─── v3.1 SESSION TOKEN ──────────────────────────────────────
+   Every request the React app makes carries an X-Session-Token
+   header. The token is issued by POST /api/login (after the user
+   types the access code) and persisted in localStorage so a page
+   reload keeps the same seat. ─────────────────────────────────── */
+const SESSION_KEY = 'idcard_session_token';
+
+function getStoredToken() {
+  try { return localStorage.getItem(SESSION_KEY) || ''; }
+  catch (_) { return ''; }
+}
+function setStoredToken(tok) {
+  try {
+    if (tok) localStorage.setItem(SESSION_KEY, tok);
+    else     localStorage.removeItem(SESSION_KEY);
+  } catch (_) { /* private-mode etc — fine, in-memory only */ }
+}
+
+// Inject the token onto every outgoing request. We use an interceptor
+// instead of a default header so we always pick up the LATEST token.
+axios.interceptors.request.use((config) => {
+  const tok = getStoredToken();
+  if (tok) {
+    config.headers = config.headers || {};
+    config.headers['X-Session-Token'] = tok;
+  }
+  return config;
+});
+
+function fmtBytes(mb) {
+  if (!mb && mb !== 0) return '—';
+  if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
+  return `${Math.round(mb)} MB`;
+}
+function fmtPct(p) {
+  if (p === undefined || p === null) return '—';
+  return `${p}%`;
+}
 
 /* ─── Fallback templates ──────────────────────────────────── */
 const TEMPLATE_COLORS = {
@@ -174,7 +221,12 @@ function Dots() {
 /* ─── Template card ───────────────────────────────────────── */
 function TemplateCard({ template, chosen, onSelect }) {
   const [imgFailed, setImgFailed] = useState(false);
+  // Re-try once if the first paint races with the backend cold-start.
+  const [retryNonce, setRetryNonce] = useState(0);
   const hasUrl = Boolean(template.preview_url);
+  const previewSrc = hasUrl
+    ? `${template.preview_url}${template.preview_url.includes('?') ? '&' : '?'}v=${retryNonce}`
+    : '';
 
   return (
     <button
@@ -185,10 +237,19 @@ function TemplateCard({ template, chosen, onSelect }) {
       <div className="tpl-preview" style={{ background: `${template.color}18` }}>
         {hasUrl && !imgFailed ? (
           <img
-            src={template.preview_url}
+            src={previewSrc}
             alt={template.display_name}
-            loading="lazy"
-            onError={() => setImgFailed(true)}
+            loading="eager"
+            decoding="async"
+            onError={() => {
+              if (retryNonce < 2) {
+                // Single one-shot retry after 600 ms — covers the case
+                // where the preview endpoint is still warming its PDF cache.
+                setTimeout(() => setRetryNonce((n) => n + 1), 600);
+              } else {
+                setImgFailed(true);
+              }
+            }}
           />
         ) : (
           <div className="tpl-preview-fallback">
@@ -257,6 +318,142 @@ function TplSkeleton() {
 }
 
 /* ─── Time estimator ──────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────
+   LoginScreen — access-code gate.
+   Locks the entire UI until /api/login returns a session token.
+   The token is then stored in localStorage so a reload keeps the
+   same seat (no double-counting against MAX_CONCURRENT_USERS).
+   ────────────────────────────────────────────────────────── */
+function LoginScreen({ onSuccess, initialSeats }) {
+  const [code, setCode]       = useState('');
+  const [busy, setBusy]       = useState(false);
+  const [error, setError]     = useState('');
+  const [seats, setSeats]     = useState(initialSeats);
+
+  // Poll seat availability every 5s so the user sees when a slot frees up.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      axios.get(`${API}/system/stats`).then((r) => {
+        if (!cancelled) setSeats({
+          active: r.data?.active_users,
+          max:    r.data?.max_users,
+        });
+      }).catch(() => {});
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  const submit = async (e) => {
+    e?.preventDefault?.();
+    if (!code.trim() || busy) return;
+    setBusy(true); setError('');
+    try {
+      const resume = getStoredToken();
+      const { data } = await axios.post(`${API}/login`,
+        { code: code.trim(), resume_token: resume || undefined });
+      if (data?.session_token) {
+        setStoredToken(data.session_token);
+        onSuccess(data);
+      } else {
+        setError('Login failed — no session token returned.');
+      }
+    } catch (err) {
+      const r = err?.response;
+      if (r?.status === 503 && r.data?.code === 'SEATS_FULL') {
+        setError(`Server is full — ${r.data.active_users}/${r.data.max_users} users are already in. Please try again in a few minutes.`);
+      } else if (r?.status === 401) {
+        setError(r.data?.error || 'Invalid access code.');
+      } else {
+        setError('Could not reach the server. Check your connection.');
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const full = seats && seats.max && seats.active >= seats.max;
+
+  return (
+    <div className="login-shell">
+      <div className="login-card">
+        <div className="login-icon"><Lock size={26} /></div>
+        <h1 className="login-title">ID Card Admin</h1>
+        <p className="login-sub">Enter your access code to continue</p>
+
+        <form onSubmit={submit} className="login-form">
+          <div className="login-input-wrap">
+            <KeyRound size={16} className="login-input-icon" />
+            <input
+              autoFocus
+              type="password"
+              placeholder="Access code"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              disabled={busy}
+            />
+          </div>
+          {error && (
+            <div className="login-error"><AlertCircle size={14} /> {error}</div>
+          )}
+          <button className="btn btn-primary btn-lg login-submit"
+                  type="submit" disabled={busy || !code.trim() || full}>
+            {busy
+              ? <><Loader2 size={14} className="spin-icon" /> Verifying…</>
+              : full
+                ? <><ShieldAlert size={14} /> Server full</>
+                : <><CheckCircle2 size={14} /> Continue</>
+            }
+          </button>
+        </form>
+
+        {seats && (
+          <div className={`login-seats ${full ? 'full' : ''}`}>
+            <Users size={13} />
+            <span><strong>{seats.active}</strong> / {seats.max} users currently active</span>
+          </div>
+        )}
+        <div className="login-fineprint">
+          Up to {seats?.max || 2} people can use this tool at once.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────
+   SystemMonitor — lives in the topbar. Polls /api/system/stats
+   every 4 seconds. Cheap (~0.05% CPU). Shows CPU%, RAM, disk, and
+   active-user count; lights up red when the server is pressured.
+   ────────────────────────────────────────────────────────── */
+function SystemMonitor({ stats }) {
+  if (!stats) {
+    return (
+      <div className="sysmon-pill">
+        <Loader2 size={12} className="spin-icon" />
+        <span>monitoring…</span>
+      </div>
+    );
+  }
+  const level = stats.ram_level || 'ok';
+  const cls   = level === 'refuse' ? 'sysmon-pill danger'
+              : level === 'warn'   ? 'sysmon-pill warn'
+              : 'sysmon-pill ok';
+  return (
+    <div className={cls} title="Live server resource usage">
+      <span className="sysmon-chunk"><Cpu size={11} /> {fmtPct(stats.cpu_pct)}</span>
+      <span className="sysmon-divider" />
+      <span className="sysmon-chunk"><MemoryStick size={11} /> {fmtBytes(stats.ram_used_mb)} / {fmtBytes(stats.ram_total_mb)}</span>
+      <span className="sysmon-divider" />
+      <span className="sysmon-chunk"><HardDrive size={11} /> {fmtPct(stats.disk_pct)}</span>
+      <span className="sysmon-divider" />
+      <span className="sysmon-chunk"><Users size={11} /> {stats.active_users}/{stats.max_users}</span>
+    </div>
+  );
+}
+
 function estimateTime(count, template) {
   // Based on measured timings from backend docstring (local = ~2x faster than prod)
   // These are prod (0.5 CPU / 512 MB) estimates. Local will be faster.
@@ -274,6 +471,14 @@ function estimateTime(count, template) {
    MAIN APP
    ───────────────────────────────────────────────────────────── */
 export default function App() {
+  /* ─── v3.1: auth + live system stats ─────────────────────────────── */
+  // authed=true once /api/login has issued a session token. We pre-fill
+  // it from localStorage so a page reload doesn't kick us back to login.
+  const [authed, setAuthed]                     = useState(!!getStoredToken());
+  const [initialSeats, setInitialSeats]         = useState(null);
+  const [sysStats, setSysStats]                 = useState(null);
+  const sysStatsTimer = useRef(null);
+
   const [status, setStatus]                     = useState(INITIAL_STATUS);
   const [schools, setSchools]                   = useState([]);
   const [templates, setTemplates]               = useState(FALLBACK_TEMPLATES);
@@ -327,12 +532,67 @@ export default function App() {
   useEffect(() => {
     return () => {
       if (elapsedTimer.current) clearInterval(elapsedTimer.current);
+      if (sysStatsTimer.current) clearInterval(sysStatsTimer.current);
       // Only cancel jobs that are still running — never delete a finished job,
       // otherwise the file gets wiped before the download can start.
       if (activeJobId.current && !jobDoneRef.current) {
         axios.delete(`${API}/jobs/${activeJobId.current}`).catch(() => {});
       }
     };
+  }, []);
+
+  /* ─── v3.1: live system-stats polling ────────────────────────────
+     Polls /api/system/stats every 2 s (down from 4 s) so the topbar
+     metrics tick noticeably.  /api/system/stats is OPEN — so we start
+     polling BEFORE login too: that way the "Connected" pill lights up
+     instantly on first paint instead of waiting for the user to type
+     the access code.
+     If the server says we're no longer a valid session (e.g. backend
+     restarted, our token was pruned, or another tab logged out), we
+     drop back to the login screen instead of failing silently. ──── */
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      axios.get(`${API}/system/stats`).then((r) => {
+        if (cancelled) return;
+        setSysStats(r.data);
+        // /api/system/stats is open — reaching it is proof the backend
+        // is alive, even before the user is logged in.
+        setBackendOk(true);
+      }).catch(() => {
+        if (!cancelled) setBackendOk(false);
+      });
+    };
+    tick();
+    sysStatsTimer.current = setInterval(tick, 2000);
+    return () => { cancelled = true; clearInterval(sysStatsTimer.current); };
+  }, [authed]);
+
+  /* ─── Detect a kicked / expired session and force re-login ────────── */
+  useEffect(() => {
+    const id = axios.interceptors.response.use(
+      (resp) => resp,
+      (err) => {
+        const r = err?.response;
+        if (r?.status === 401 && (r.data?.code === 'NO_SESSION' || r.data?.code === 'BAD_SESSION')) {
+          setStoredToken('');
+          setAuthed(false);
+          setSysStats(null);
+        }
+        return Promise.reject(err);
+      }
+    );
+    return () => axios.interceptors.response.eject(id);
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    axios.post(`${API}/logout`).catch(() => {});
+    setStoredToken('');
+    setAuthed(false);
+    setSysStats(null);
+    setStatus(INITIAL_STATUS);
+    setActiveStep(0);
+    setTemplateConfirmed(false);
   }, []);
 
   /* ── Derived ── */
@@ -401,16 +661,26 @@ export default function App() {
           classCounts: r.data?.classCounts || r.data?.class_counts || {},
         });
       }
-    }).catch(() => setBackendOk(false));
+    }).catch((err) => {
+      // 401 just means we're not logged in yet — that's NOT "offline".
+      // Only treat real network/5xx failures as offline so the pill
+      // doesn't flicker red while the user is typing the access code.
+      const st = err?.response?.status;
+      if (!st || st >= 500) setBackendOk(false);
+    });
   }, []);
 
   // Removed the 60-second fixed ping interval — it was causing
   // a React state update mid-download that triggered cleanup/DELETE
   // on the active job before the file could be fetched.
 
+  /*  Initial boot:
+      /api/templates is OPEN (no auth needed) so we load the carousel
+      IMMEDIATELY on first paint — the template thumbnails show before
+      the user even logs in, instead of being stuck on "loading…".
+      /api/status + /api/schools/students depend on `authed` and re-fire
+      the moment login succeeds. ────────────────────────────────── */
   useEffect(() => {
-    refreshStatus();
-    axios.get(`${API}/schools`).then((r) => setSchools(r.data || [])).catch(() => {});
     setLoadingTemplates(true);
     axios.get(`${API}/templates`).then((r) => {
       const raw = Array.isArray(r.data) && r.data.length ? r.data : FALLBACK_TEMPLATES;
@@ -424,7 +694,16 @@ export default function App() {
       setTemplates(list);
       setSelectedTemplate((prev) => list.some((t) => t.key === prev) ? prev : list[0]?.key || 'redeemer');
     }).catch(() => setTemplates(FALLBACK_TEMPLATES)).finally(() => setLoadingTemplates(false));
-  }, [refreshStatus]);
+  }, []);
+
+  // Once the user is authed, refresh status + load schools.  These are
+  // session-gated so doing them before login would just return 401 and
+  // make the UI feel broken.
+  useEffect(() => {
+    if (!authed) return;
+    refreshStatus();
+    axios.get(`${API}/schools`).then((r) => setSchools(r.data || [])).catch(() => {});
+  }, [authed, refreshStatus]);
 
   useEffect(() => {
     if (!studentClass) { setStudentNames([]); setStudentName(''); return; }
@@ -790,10 +1069,43 @@ export default function App() {
   /* ─────────────────────────────────────────────────────────
      RENDER
      ───────────────────────────────────────────────────────── */
+  // v3.1: gate the whole UI behind the access-code login.
+  if (!authed) {
+    return (
+      <LoginScreen
+        initialSeats={initialSeats}
+        onSuccess={(data) => {
+          setInitialSeats({ active: data.active_users, max: data.max_users });
+          setAuthed(true);
+        }}
+      />
+    );
+  }
+
+  const ramRefuse = sysStats?.ram_level === 'refuse' || sysStats?.refuse_new_jobs;
+  const ramWarn   = sysStats?.ram_level === 'warn';
+
   return (
     <div className="app-shell">
       <Toast toasts={toasts} removeToast={removeToast} />
       {modal && <PDFModal url={modal.url} title={modal.title} external={modal.external} onClose={closeModal} />}
+
+      {/* ── v3.1: red banner when server is memory-pressured ── */}
+      {ramRefuse && (
+        <div className="server-banner danger">
+          <ShieldAlert size={16} />
+          <div>
+            <strong>Server memory pressured ({fmtBytes(sysStats.ram_used_mb)} / {fmtBytes(sysStats.ram_total_mb)})</strong>
+            <span> — New PDF jobs are temporarily blocked. Please wait a minute and retry.</span>
+          </div>
+        </div>
+      )}
+      {!ramRefuse && ramWarn && (
+        <div className="server-banner warn">
+          <AlertCircle size={14} />
+          <span>Server memory is getting high ({fmtBytes(sysStats.ram_used_mb)} / {fmtBytes(sysStats.ram_total_mb)}). Big jobs may slow down.</span>
+        </div>
+      )}
 
       {/* ── Top bar ── */}
       <header className="topbar">
@@ -802,12 +1114,14 @@ export default function App() {
           ID Card Generator
         </div>
         <div className="topbar-right">
+          <SystemMonitor stats={sysStats} />
           <div className={`backend-pill ${backendOk === true ? 'ok' : backendOk === false ? 'err' : ''}`}>
             {backendOk === true  && <><span className="status-dot" /> Connected</>}
             {backendOk === false && <><AlertCircle size={13} /> Offline</>}
             {backendOk === null  && <><span className="status-dot pulse" /> Checking…</>}
           </div>
           <button className="btn btn-ghost btn-sm" onClick={resetWorkflow}><RotateCcw size={14} /> Reset</button>
+          <button className="btn btn-ghost btn-sm" onClick={handleLogout} title="Sign out"><LogOut size={14} /> Logout</button>
         </div>
       </header>
 
