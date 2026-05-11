@@ -1171,3 +1171,167 @@ code {
   0%   { transform:translateX(-150%); }
   100% { transform:translateX(350%); }
 }
+
+/* ============================================================
+   v3.1 — LOGIN SCREEN + SYSTEM MONITOR + SERVER BANNERS
+   ============================================================ */
+
+/* ── Login screen ── */
+.login-shell {
+  min-height: 100vh;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #EEF2FF 0%, #F4F6FB 60%, #FFFFFF 100%);
+  padding: 24px;
+}
+.login-card {
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #E2E8F0);
+  border-radius: 20px;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, .12);
+  padding: 36px 32px 28px;
+  width: 100%;
+  max-width: 420px;
+  text-align: center;
+  animation: loginFade .35s ease;
+}
+@keyframes loginFade {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.login-icon {
+  width: 56px; height: 56px;
+  margin: 0 auto 16px;
+  border-radius: 16px;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #4F46E5, #6366F1);
+  color: #fff;
+  box-shadow: 0 8px 22px rgba(79, 70, 229, .35);
+}
+.login-title {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--text, #0F172A);
+  margin-bottom: 6px;
+  letter-spacing: -.01em;
+}
+.login-sub {
+  font-size: 13px;
+  color: var(--text-2, #475569);
+  margin-bottom: 22px;
+}
+.login-form { display: flex; flex-direction: column; gap: 12px; }
+.login-input-wrap {
+  position: relative;
+  display: flex; align-items: center;
+}
+.login-input-icon {
+  position: absolute;
+  left: 14px;
+  color: var(--text-3, #94A3B8);
+  pointer-events: none;
+}
+.login-input-wrap input {
+  width: 100%;
+  padding: 13px 14px 13px 38px;
+  border: 1.5px solid var(--border, #E2E8F0);
+  border-radius: 12px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  background: #FFF;
+  color: var(--text, #0F172A);
+  outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.login-input-wrap input:focus {
+  border-color: var(--primary, #4F46E5);
+  box-shadow: 0 0 0 4px rgba(79, 70, 229, .14);
+}
+.login-error {
+  display: flex; align-items: flex-start; gap: 8px;
+  font-size: 12.5px; font-weight: 600;
+  color: var(--danger, #DC2626);
+  background: var(--danger-light, #FEF2F2);
+  border: 1px solid #FECACA;
+  border-radius: 10px;
+  padding: 9px 11px;
+  text-align: left;
+  line-height: 1.4;
+}
+.login-submit { margin-top: 4px; justify-content: center; }
+.login-seats {
+  margin-top: 18px;
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600;
+  color: var(--text-2, #475569);
+  background: #F1F5F9;
+  border-radius: 99px;
+  padding: 6px 12px;
+}
+.login-seats.full {
+  background: var(--danger-light, #FEF2F2);
+  color: var(--danger, #DC2626);
+}
+.login-fineprint {
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--text-3, #94A3B8);
+}
+
+/* ── System monitor pill (topbar) ── */
+.sysmon-pill {
+  display: inline-flex; align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  padding: 6px 11px;
+  border-radius: 99px;
+  background: #F1F5F9;
+  border: 1px solid var(--border, #E2E8F0);
+  color: var(--text-2, #475569);
+  white-space: nowrap;
+  transition: background .2s ease, border-color .2s ease, color .2s ease;
+}
+.sysmon-pill.ok      { background:#ECFDF5; border-color:#A7F3D0; color:#065F46; }
+.sysmon-pill.warn    { background:#FFFBEB; border-color:#FCD34D; color:#92400E; }
+.sysmon-pill.danger  { background:#FEF2F2; border-color:#FCA5A5; color:#991B1B; animation: pulseDanger 1.6s ease-in-out infinite; }
+.sysmon-chunk { display:inline-flex; align-items:center; gap:4px; }
+.sysmon-divider {
+  width: 1px; height: 12px;
+  background: currentColor;
+  opacity: .25;
+}
+@keyframes pulseDanger {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, .35); }
+  50%      { box-shadow: 0 0 0 6px rgba(220, 38, 38, 0);  }
+}
+@media (max-width: 768px) {
+  .sysmon-pill { font-size: 10.5px; padding: 5px 8px; gap: 5px; }
+  .sysmon-divider { display: none; }
+}
+
+/* ── Server banners (RAM warn / refuse) ── */
+.server-banner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  border-bottom: 1px solid transparent;
+}
+.server-banner.warn {
+  background: #FFFBEB;
+  border-bottom-color: #FCD34D;
+  color: #92400E;
+}
+.server-banner.danger {
+  background: #FEF2F2;
+  border-bottom-color: #FCA5A5;
+  color: #991B1B;
+  animation: pulseDanger 1.6s ease-in-out infinite;
+}
+.server-banner strong { font-weight: 800; }
