@@ -42,20 +42,31 @@ const normalizeApiBase = (rawValue) => {
 };
 
 const detectApiOrigin = () => {
+  // 1) explicit override always wins
   const explicit = (process.env.REACT_APP_API_URL || '').trim().replace(/\/+$/, '');
-  if (explicit) return explicit.replace(/\/api$/i, '');
-
-  const host = window.location.hostname;
-  const proto = window.location.protocol;
-
-  // Local React dev server commonly runs on :3000 while Flask runs on :5000.
-  // Use the backend directly so the app does not depend on CRA proxy config.
-  if (host === 'localhost' || host === '127.0.0.1') {
-    return `${proto}//${host}:5000`;
+  if (explicit) {
+    // user may set 'school-api-id.titussolutions.in' (no scheme) — add https.
+    const withScheme = /^https?:\/\//i.test(explicit) ? explicit : `https://${explicit}`;
+    return withScheme.replace(/\/api$/i, '');
   }
 
-  // When frontend is served by the same host (production / reverse proxy),
-  // same-origin /api is the safest default.
+  // 2) DEV server.  ALWAYS return same-origin '' so that:
+  //      a) CRA proxy in package.json ('http://localhost:5000') handles forwarding
+  //      b) localhost vs 127.0.0.1 vs 192.168.x.x vs ::1 all work identically
+  //      c) we never get the IPv6 ::1 vs IPv4 127.0.0.1 hang that prevented
+  //         login from completing on Windows + Chrome.
+  // Returning '' tells normalizeApiBase to fall back to '/api', which is the
+  // SAME origin as the React dev server (port 3000) → CRA proxy kicks in.
+  const host = (window.location.hostname || '').toLowerCase();
+  const isDevPort = window.location.port === '3000';
+  if (isDevPort) {
+    // CRA dev server — let the proxy do its job. Works for ALL hostnames:
+    // localhost, 127.0.0.1, 192.168.x.x, your LAN IP, ngrok tunnels, etc.
+    return '';
+  }
+
+  // 3) Production (frontend built and served by the same host as Flask):
+  //    use same-origin so HTTPS / cookies / CORS all line up automatically.
   return window.location.origin;
 };
 
@@ -418,8 +429,12 @@ function LoginScreen({ onSuccess, initialSeats }) {
         setError(`Server is full — ${r.data.active_users}/${r.data.max_users} users are already in. Please try again in a few minutes.`);
       } else if (r?.status === 401) {
         setError(r.data?.error || 'Invalid access code.');
+      } else if (!r) {
+        // No HTTP response at all — either CORS, server down, or the dreaded
+        // localhost-IPv6 vs IPv4 mismatch on Windows.
+        setError('Could not reach the server. If you are running locally, try http://127.0.0.1:3000 instead of http://localhost:3000, or restart `npm start`.');
       } else {
-        setError('Could not reach the server. Check your connection.');
+        setError(`Server error (${r.status}). ` + (r.data?.error || 'Please try again.'));
       }
     } finally {
       setBusy(false);
@@ -469,6 +484,10 @@ function LoginScreen({ onSuccess, initialSeats }) {
         )}
         <div className="login-fineprint">
           Up to {seats?.max || 2} people can use this tool at once.
+          <br />
+          <small style={{ color: 'var(--text-3, #94A3B8)', fontSize: 11 }}>
+            A seat is freed after 15 minutes of inactivity. Generated PDFs are kept on the server for 30 minutes.
+          </small>
         </div>
       </div>
     </div>
@@ -773,6 +792,19 @@ export default function App() {
   // a React state update mid-download that triggered cleanup/DELETE
   // on the active job before the file could be fetched.
 
+  /* ─── Session timing constants (mirror /api/system/stats) ──────── */
+  // These are shown to the user in the topbar so they know:
+  //   • idle seat timeout: 15 min (server kicks idle tabs to free a seat)
+  //   • finished-job retention: 30 min (PDF on disk auto-purged after this)
+  //   • slot wait: 3 min (max time we wait for a render slot when busy)
+  const TIMINGS = {
+    SESSION_TTL_MIN:        15,   // seat freed after this many minutes idle
+    JOB_FILE_TTL_MIN:       30,   // a generated PDF stays on disk this long
+    PDF_SLOT_WAIT_S:        180,  // wait up to 3 min for a render slot
+    POLL_INTERVAL_MS:       700,
+    POLL_MAX_BLIPS:         200,  // ~140 s of connection blips tolerated
+  };
+
   /*  Initial boot:
       /api/templates is OPEN (no auth needed) so we load the carousel
       IMMEDIATELY on first paint — the template thumbnails show before
@@ -948,23 +980,62 @@ export default function App() {
         }, 700);
       });
 
-      // 3) Download the finished file
+      // 3) Download the finished file.
+      //    NOTE: the backend may delete the disk file inside @after_this_request
+      //    as soon as the HTTP stream finishes. If the laptop's Wi-Fi flaps,
+            //    the browser retries with `Range:` and gets 410 FILE_GONE.
+      //    We now retry up to 4 times — and on FILE_GONE we re-start the job
+      //    (free of charge — the data is already in session) so the user
+      //    never sees a "network error" on big PDFs.
       setGenPhase('downloading');
-      const fileUrl = `${API}/jobs/${jobId}/file`;
+      const downloadOnce = async (id) => axios.get(`${API}/jobs/${id}/file`, {
+        responseType: 'blob',
+        timeout: 30 * 60 * 1000,
+        // Prevent Chrome from caching the partial body — kills the Range-retry
+        // path that was causing "network error" on slow Wi-Fi.
+        headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' },
+      });
 
       let resp = null;
-      // Retry once on transient gateway errors (502/503/504)
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      let currentJobId = jobId;
+      const MAX_ATTEMPTS = 4;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-          resp = await axios.get(fileUrl, {
-            responseType: 'blob',
-            timeout: 30 * 60 * 1000,   // 30-min cap — more than enough for any batch
-          });
+          resp = await downloadOnce(currentJobId);
           break;
         } catch (e) {
           const sc = e?.response?.status;
-          if (attempt === 1 && (!sc || sc === 502 || sc === 503 || sc === 504)) {
-            await new Promise((r) => setTimeout(r, 2000));
+          // 410 FILE_GONE = backend already deleted the file (the @after_this_request
+          // cleanup ran on the SERVER even though the BROWSER lost the bytes).
+          // Rebuild the PDF by starting a fresh job for the same selection.
+          if (sc === 410 && attempt < MAX_ATTEMPTS) {
+            try {
+              const re = await axios.post(startUrl, null);
+              const reData = re.data || {};
+              if (reData.job_id) {
+                currentJobId = reData.job_id;
+                activeJobId.current = currentJobId;
+                jobDoneRef.current = false;
+                // poll the rebuilt job until done
+                await new Promise((resolve, reject) => {
+                  const t = window.setInterval(async () => {
+                    try {
+                      const { data } = await axios.get(`${API}/jobs/${currentJobId}/progress`);
+                      setGenProgress(Math.min(99, Math.round(data.progress || 0)));
+                      setGenPhase(data.phase || '');
+                      if (data.status === 'done')  { jobDoneRef.current = true; window.clearInterval(t); resolve(); }
+                      if (data.status === 'error') { window.clearInterval(t); reject(new Error(data.error || 'Rebuild failed')); }
+                    } catch {}
+                  }, 700);
+                });
+                setGenPhase('downloading');
+                continue;
+              }
+            } catch (_) { /* fall through to normal retry */ }
+          }
+          // Transient gateway / network blip — wait + retry
+          if (attempt < MAX_ATTEMPTS && (!sc || sc === 502 || sc === 503 || sc === 504 || sc === 0)) {
+            await new Promise((r) => setTimeout(r, 1500 + attempt * 1000));
             continue;
           }
           throw e;
