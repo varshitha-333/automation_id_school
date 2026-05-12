@@ -41,8 +41,26 @@ const normalizeApiBase = (rawValue) => {
   return cleaned.endsWith('/api') ? cleaned : `${cleaned}/api`;
 };
 
-const API        = normalizeApiBase(process.env.REACT_APP_API_URL || '/api');
-const API_ORIGIN = (process.env.REACT_APP_API_URL || '').replace(/\/+$/, '');
+const detectApiOrigin = () => {
+  const explicit = (process.env.REACT_APP_API_URL || '').trim().replace(/\/+$/, '');
+  if (explicit) return explicit.replace(/\/api$/i, '');
+
+  const host = window.location.hostname;
+  const proto = window.location.protocol;
+
+  // Local React dev server commonly runs on :3000 while Flask runs on :5000.
+  // Use the backend directly so the app does not depend on CRA proxy config.
+  if (host === 'localhost' || host === '127.0.0.1') {
+    return `${proto}//${host}:5000`;
+  }
+
+  // When frontend is served by the same host (production / reverse proxy),
+  // same-origin /api is the safest default.
+  return window.location.origin;
+};
+
+const API_ORIGIN = detectApiOrigin();
+const API        = normalizeApiBase(`${API_ORIGIN}/api`);
 
 axios.defaults.headers.common['X-Requested-With'] = 'XMLHttpRequest';
 
