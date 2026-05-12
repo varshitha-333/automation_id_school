@@ -988,12 +988,18 @@ export default function App() {
       //    (free of charge — the data is already in session) so the user
       //    never sees a "network error" on big PDFs.
       setGenPhase('downloading');
+      // v3.5 CORS FIX:
+      //   Do NOT send Cache-Control / Pragma headers from the browser.
+      //   They are NOT 'simple' CORS headers, so the browser forces an
+      //   OPTIONS preflight on EVERY GET. If the server's
+      //   Access-Control-Allow-Headers doesn't echo them back EXACTLY,
+      //   the browser silently aborts the GET — producing the
+      //   "many OPTIONS, zero GET" pattern we saw in Railway logs.
+      //   The backend already sets 'Cache-Control: no-store' in _add_cors,
+      //   so we don't need to send anything from the client.
       const downloadOnce = async (id) => axios.get(`${API}/jobs/${id}/file`, {
         responseType: 'blob',
         timeout: 30 * 60 * 1000,
-        // Prevent Chrome from caching the partial body — kills the Range-retry
-        // path that was causing "network error" on slow Wi-Fi.
-        headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' },
       });
 
       let resp = null;
