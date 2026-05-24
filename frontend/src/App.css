@@ -147,6 +147,64 @@ img { display: block; max-width: 100%; }
 }
 
 /* ────────────────────────────────────────
+   v2.9 — WIZARD BACK ROW
+   Sits above the step progress indicator and lets the user step back
+   through the wizard or return to the Student/Employee mode picker.
+   ──────────────────────────────────────── */
+.wizard-back-row {
+  width: 100%;
+  max-width: 980px;
+  margin: 0 auto 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.btn-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--ease);
+  box-shadow: var(--sh-xs);
+}
+.btn-back:hover {
+  background: var(--primary-light);
+  color: var(--primary-dark);
+  border-color: var(--primary-mid);
+  transform: translateX(-2px);
+}
+.btn-back:active { transform: translateX(0); }
+.btn-back:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.wizard-back-mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--primary-light);
+  color: var(--primary-dark);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  border: 1px solid var(--primary-mid);
+}
+
+/* ────────────────────────────────────────
    STEP PROGRESS INDICATOR
    ──────────────────────────────────────── */
 .step-track {
@@ -1343,3 +1401,138 @@ code {
   animation: pulseDanger 1.6s ease-in-out infinite;
 }
 .server-banner strong { font-weight: 800; }
+
+/* ============================================================
+   v2.8 — MODE PICKER (Students / Employees) + EMPLOYEE WIDGETS
+   ============================================================ */
+
+.wizard-card.mode-picker {
+  max-width: 880px;
+  margin: 0 auto;
+}
+
+.mode-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  padding: 4px 0 8px;
+}
+
+.mode-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  text-align: left;
+  padding: 20px;
+  background: var(--surface);
+  border: 1.5px solid var(--border);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition: border-color var(--ease), transform var(--ease), box-shadow var(--ease);
+  font-family: inherit;
+}
+
+.mode-tile:hover {
+  border-color: var(--primary-mid);
+  transform: translateY(-2px);
+  box-shadow: var(--sh-sm);
+}
+
+.mode-tile-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+}
+
+.mode-tile-icon.student  { background: linear-gradient(135deg, #4F46E5, #6366F1); }
+.mode-tile-icon.employee { background: linear-gradient(135deg, #059669, #10B981); }
+
+.mode-tile-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.mode-tile-desc {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+
+.mode-tile-cta {
+  margin-top: auto;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--primary);
+  padding-top: 6px;
+}
+
+.mode-helper {
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: var(--primary-light);
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--primary-light);
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 700;
+  vertical-align: middle;
+}
+
+.source-tab.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.source-tab:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── Mode tabs (Students / Employees) ─────────────────────── */
+.mode-tabs {
+  display: flex;
+  gap: 3px;
+  background: var(--surface-2, #F1F5F9);
+  border-radius: var(--r-sm, 8px);
+  padding: 3px;
+}
+.mode-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 13px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-2, #64748B);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.mode-tab.active {
+  background: var(--card-bg, #fff);
+  color: var(--primary, #4F46E5);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.10);
+}
+.mode-tab:hover:not(.active) {
+  background: rgba(0,0,0,0.04);
+  color: var(--text-1, #1E293B);
+}

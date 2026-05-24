@@ -383,26 +383,38 @@ function TplSkeleton() {
    The token is then stored in localStorage so a reload keeps the
    same seat (no double-counting against MAX_CONCURRENT_USERS).
    ────────────────────────────────────────────────────────── */
-function LoginScreen({ onSuccess, initialSeats }) {
+function LoginScreen({ onSuccess, initialSeats, initialError }) {
   const [code, setCode]       = useState('');
   const [busy, setBusy]       = useState(false);
-  const [error, setError]     = useState('');
+  const [error, setError]     = useState(initialError || '');
   const [seats, setSeats]     = useState(initialSeats);
+
+  useEffect(() => {
+    if (initialError) {
+      setError(initialError);
+    }
+  }, [initialError]);
 
   // Poll seat availability every 5s so the user sees when a slot frees up.
   useEffect(() => {
     let cancelled = false;
+    let timerId = null;
     const tick = () => {
+      if (cancelled) return;
       axios.get(`${API}/system/stats`).then((r) => {
-        if (!cancelled) setSeats({
+        if (cancelled) return;
+        setSeats({
           active: r.data?.active_users,
           max:    r.data?.max_users,
         });
-      }).catch(() => {});
+        timerId = window.setTimeout(tick, 5000);
+      }).catch(() => {
+        if (cancelled) return;
+        timerId = window.setTimeout(tick, 5000);
+      });
     };
     tick();
-    const id = setInterval(tick, 5000);
-    return () => { cancelled = true; clearInterval(id); };
+    return () => { cancelled = true; if (timerId) window.clearTimeout(timerId); };
   }, []);
 
   const submit = async (e) => {
@@ -578,11 +590,44 @@ export default function App() {
   const [genLabel,    setGenLabel]              = useState('');   // human-readable label for active job
   const [elapsedSecs, setElapsedSecs]           = useState(0);   // wall-clock seconds since job start
 
+  // ── Mode: 'students' | 'employees' ──────────────────────────
+  const [mode, setMode] = useState('students');
+
+  // ── Employee state ───────────────────────────────────────────
+  const [empStatus,          setEmpStatus]          = useState({ loaded: false, count: 0, classes: [], classCounts: {} });
+  const [empTemplates,       setEmpTemplates]       = useState([]);
+  const [selectedEmpTpl,     setSelectedEmpTpl]     = useState('');
+  const [empTplConfirmed,    setEmpTplConfirmed]    = useState(false);
+  const [empLoadingTpls,     setEmpLoadingTpls]     = useState(false);
+  const [empUploading,       setEmpUploading]       = useState(false);
+  const [empCardLoading,     setEmpCardLoading]     = useState(null);
+  const [empActiveStep,      setEmpActiveStep]      = useState(0);
+  const [empGenDone,         setEmpGenDone]         = useState(false);
+  const [empGenProgress,     setEmpGenProgress]     = useState(0);
+  const [empGenPhase,        setEmpGenPhase]        = useState('');
+  const [empSearchQuery,     setEmpSearchQuery]     = useState('');
+  const [empModal,           setEmpModal]           = useState(null);
+  const [showEmpAdvanced,    setShowEmpAdvanced]    = useState(false);
+  const [empDesigFilter,     setEmpDesigFilter]     = useState('');
+  const [empSelectedName,    setEmpSelectedName]    = useState('');
+  const [empNameOptions,     setEmpNameOptions]     = useState([]);
+  const [empIndivLoading,    setEmpIndivLoading]    = useState(null);
+  const [empElapsedSecs,     setEmpElapsedSecs]     = useState(0);
+  const empFileRef       = useRef(null);
+  const empElapsedTimer  = useRef(null);
+  const empActiveJobId   = useRef(null);
+  const empJobDoneRef    = useRef(false);
+
   const fileRef      = useRef(null);
   const toastIdRef   = useRef(0);
   const elapsedTimer = useRef(null);   // interval for wall-clock counter
   const activeJobId  = useRef(null);   // track running job so we can cancel on unmount
   const jobDoneRef   = useRef(false);  // true once server reports status=done — never DELETE then
+  const isBusyRef    = useRef(false);
+  const [loginScreenError, setLoginScreenError] = useState('');
+
+  // Sync the isBusyRef with current activity state on every render
+  isBusyRef.current = !!(activeJobId.current || cardLoading || studentLoading);
 
   /* ── Toast helpers ── */
   const addToast = useCallback((message, type = 'info', duration = 4000) => {
@@ -603,7 +648,7 @@ export default function App() {
   useEffect(() => {
     return () => {
       if (elapsedTimer.current) clearInterval(elapsedTimer.current);
-      if (sysStatsTimer.current) clearInterval(sysStatsTimer.current);
+      if (sysStatsTimer.current) clearTimeout(sysStatsTimer.current);
       // Only cancel jobs that are still running — never delete a finished job,
       // otherwise the file gets wiped before the download can start.
       if (activeJobId.current && !jobDoneRef.current) {
@@ -621,22 +666,43 @@ export default function App() {
      If the server says we're no longer a valid session (e.g. backend
      restarted, our token was pruned, or another tab logged out), we
      drop back to the login screen instead of failing silently. ──── */
+  // v3.2: 4 consecutive failures required before flipping the
+  // "Connected" pill to "Offline" — stops single network hiccups
+  // from making the indicator flicker. Tolerates CPU-heavy queuing delays.
+  const failStreakRef = useRef(0);
   useEffect(() => {
     let cancelled = false;
     const tick = () => {
-      axios.get(`${API}/system/stats`).then((r) => {
+      if (cancelled) return;
+      axios.get(`${API}/system/stats`, { timeout: 4000 }).then((r) => {
         if (cancelled) return;
         setSysStats(r.data);
+        failStreakRef.current = 0;
         // /api/system/stats is open — reaching it is proof the backend
         // is alive, even before the user is logged in.
         setBackendOk(true);
+        sysStatsTimer.current = window.setTimeout(tick, 2000);
       }).catch(() => {
-        if (!cancelled) setBackendOk(false);
+        if (cancelled) return;
+        
+        const isBusy = isBusyRef.current;
+        if (!isBusy) {
+          failStreakRef.current += 1;
+          // Require 4 consecutive failures before flipping to "Offline".
+          if (failStreakRef.current >= 4) {
+            setBackendOk(false);
+          }
+        }
+        
+        // On the FIRST failure, retry quickly (after 500 ms) so a real
+        // outage is still surfaced fast (~2.5 s total) while transient
+        // glitches are just re-tried.
+        const delay = (!isBusy && failStreakRef.current === 1) ? 500 : 2000;
+        sysStatsTimer.current = window.setTimeout(tick, delay);
       });
     };
     tick();
-    sysStatsTimer.current = setInterval(tick, 2000);
-    return () => { cancelled = true; clearInterval(sysStatsTimer.current); };
+    return () => { cancelled = true; if (sysStatsTimer.current) window.clearTimeout(sysStatsTimer.current); };
   }, [authed]);
 
   /* ─── Detect a kicked / expired session and force re-login ────────── */
@@ -645,16 +711,26 @@ export default function App() {
       (resp) => resp,
       (err) => {
         const r = err?.response;
-        if (r?.status === 401 && (r.data?.code === 'NO_SESSION' || r.data?.code === 'BAD_SESSION')) {
+        if (
+          r?.status === 401 &&
+          (r.data?.code === 'NO_SESSION' || r.data?.code === 'BAD_SESSION' || r.data?.code === 'SESSION_TIMEOUT')
+        ) {
           setStoredToken('');
           setAuthed(false);
           setSysStats(null);
+          if (r.data?.code === 'SESSION_TIMEOUT') {
+            setLoginScreenError('Your session has expired due to 15 minutes of inactivity. Please log in again.');
+            addToast('Your session has expired due to 15 minutes of inactivity. Please log in again.', 'error', 6000);
+          } else {
+            setLoginScreenError('Your session has expired or is invalid. Please log in again.');
+            addToast('Your session has expired or is invalid. Please log in again.', 'error', 6000);
+          }
         }
         return Promise.reject(err);
       }
     );
     return () => axios.interceptors.response.eject(id);
-  }, []);
+  }, [addToast]);
 
   const handleLogout = useCallback(async () => {
     const clientId = getClientId();
@@ -719,7 +795,9 @@ export default function App() {
     [templates, selectedTemplate]);
 
   const withTemplate = useCallback((baseUrl, extra = {}) => {
+    const tok = getStoredToken();
     const params = new URLSearchParams({ ...extra, template: selectedTemplate });
+    if (tok) params.append('token', tok);
     return `${baseUrl}?${params.toString()}`;
   }, [selectedTemplate]);
 
@@ -827,9 +905,45 @@ export default function App() {
     }).catch(() => setTemplates(FALLBACK_TEMPLATES)).finally(() => setLoadingTemplates(false));
   }, []);
 
-  // Once the user is authed, refresh status + load schools.  These are
-  // session-gated so doing them before login would just return 401 and
-  // make the UI feel broken.
+  // Load employee templates — gated on authed (endpoint requires session)
+  useEffect(() => {
+    if (!authed) return;
+    setEmpLoadingTpls(true);
+    axios.get(`${API}/employees/templates`).then((r) => {
+      const raw = Array.isArray(r.data) && r.data.length ? r.data : [];
+      const list = raw.map((t) => ({
+        ...t,
+        color: t.color || TEMPLATE_COLORS[t.key] || '#4F46E5',
+        preview_url: t.preview_url
+          ? (t.preview_url.startsWith('http') ? t.preview_url : `${API_ORIGIN}${t.preview_url.startsWith('/') ? '' : '/'}${t.preview_url}`)
+          : `${API_ORIGIN}/api/templates/${t.key}/preview.png`,
+      }));
+      setEmpTemplates(list);
+      if (list.length) setSelectedEmpTpl(list[0].key);
+    }).catch(() => {}).finally(() => setEmpLoadingTpls(false));
+  }, [authed]);
+
+  // Once authed, also refresh employee status
+  useEffect(() => {
+    if (!authed) return;
+    axios.get(`${API}/employees/status`).then((r) => {
+      if (r.data?.loaded) {
+        const counts = {};
+        (r.data.classes || []).forEach((c) => { counts[c] = r.data.classCounts?.[c] ?? 0; });
+        setEmpStatus({
+          loaded: true,
+          count: r.data.count,
+          classes: r.data.classes || [],
+          classCounts: r.data.classCounts || counts,
+          school_name: r.data.school_name,
+        });
+      }
+    }).catch(() => {});
+  }, [authed]);
+
+
+
+  // Once the user is authed, refresh status + load schools.
   useEffect(() => {
     if (!authed) return;
     refreshStatus();
@@ -946,114 +1060,78 @@ export default function App() {
       const MAX_CONSECUTIVE_ERRORS = 200; // ~140s of blips at 700ms intervals
 
       await new Promise((resolve, reject) => {
-        pollTimer = window.setInterval(async () => {
+        let isStopped = false;
+        const poll = async () => {
+          if (isStopped) return;
           try {
             const { data } = await axios.get(
               `${API}/jobs/${jobId}/progress`,
             );
+            if (isStopped) return;
             consecutiveErrors = 0;
             setGenProgress(Math.min(99, Math.round(data.progress || 0)));
             setGenPhase(data.phase || '');
 
             if (data.status === 'done') {
               jobDoneRef.current = true;
-              window.clearInterval(pollTimer);
-              pollTimer = null;
+              isStopped = true;
               resolve();
+              return;
             }
             if (data.status === 'error') {
-              window.clearInterval(pollTimer);
-              pollTimer = null;
+              isStopped = true;
               reject(new Error(data.error || 'PDF generation failed on server'));
+              return;
             }
           } catch {
+            if (isStopped) return;
             consecutiveErrors += 1;
             if (consecutiveErrors > MAX_CONSECUTIVE_ERRORS) {
-              window.clearInterval(pollTimer);
-              pollTimer = null;
+              isStopped = true;
               reject(new Error(
                 'Lost connection to server for >2 minutes while waiting. ' +
                 'The PDF may still be generating — please check back or retry.'
               ));
+              return;
             }
           }
-        }, 700);
+          pollTimer = window.setTimeout(poll, 700);
+        };
+        poll();
       });
 
-      // 3) Download the finished file.
-      //    NOTE: the backend may delete the disk file inside @after_this_request
-      //    as soon as the HTTP stream finishes. If the laptop's Wi-Fi flaps,
-            //    the browser retries with `Range:` and gets 410 FILE_GONE.
-      //    We now retry up to 4 times — and on FILE_GONE we re-start the job
-      //    (free of charge — the data is already in session) so the user
-      //    never sees a "network error" on big PDFs.
+      // 3) Trigger download via a plain <a> tag.
+      //
+      // WHY NOT XHR/fetch: Chrome's XHR blob pipeline aborts cross-origin
+      // responses over ~16 MB with net::ERR_FAILED 200 (OK) — a Chrome-internal
+      // limit that cannot be worked around in JS.
+      //
+      // WHY <a href>: the browser's native download manager has no size limit.
+      // It can't send custom headers, so we append ?token= to the URL so Flask
+      // auth passes the token via query-string instead.
       setGenPhase('downloading');
-      // v3.5 CORS FIX:
-      //   Do NOT send Cache-Control / Pragma headers from the browser.
-      //   They are NOT 'simple' CORS headers, so the browser forces an
-      //   OPTIONS preflight on EVERY GET. If the server's
-      //   Access-Control-Allow-Headers doesn't echo them back EXACTLY,
-      //   the browser silently aborts the GET — producing the
-      //   "many OPTIONS, zero GET" pattern we saw in Railway logs.
-      //   The backend already sets 'Cache-Control: no-store' in _add_cors,
-      //   so we don't need to send anything from the client.
-      const downloadOnce = async (id) => axios.get(`${API}/jobs/${id}/file`, {
-        responseType: 'blob',
-        timeout: 30 * 60 * 1000,
-      });
-
-      let resp = null;
-      let currentJobId = jobId;
-      const MAX_ATTEMPTS = 4;
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        try {
-          resp = await downloadOnce(currentJobId);
-          break;
-        } catch (e) {
-          const sc = e?.response?.status;
-          // 410 FILE_GONE = backend already deleted the file (the @after_this_request
-          // cleanup ran on the SERVER even though the BROWSER lost the bytes).
-          // Rebuild the PDF by starting a fresh job for the same selection.
-          if (sc === 410 && attempt < MAX_ATTEMPTS) {
-            try {
-              const re = await axios.post(startUrl, null);
-              const reData = re.data || {};
-              if (reData.job_id) {
-                currentJobId = reData.job_id;
-                activeJobId.current = currentJobId;
-                jobDoneRef.current = false;
-                // poll the rebuilt job until done
-                await new Promise((resolve, reject) => {
-                  const t = window.setInterval(async () => {
-                    try {
-                      const { data } = await axios.get(`${API}/jobs/${currentJobId}/progress`);
-                      setGenProgress(Math.min(99, Math.round(data.progress || 0)));
-                      setGenPhase(data.phase || '');
-                      if (data.status === 'done')  { jobDoneRef.current = true; window.clearInterval(t); resolve(); }
-                      if (data.status === 'error') { window.clearInterval(t); reject(new Error(data.error || 'Rebuild failed')); }
-                    } catch {}
-                  }, 700);
-                });
-                setGenPhase('downloading');
-                continue;
-              }
-            } catch (_) { /* fall through to normal retry */ }
-          }
-          // Transient gateway / network blip — wait + retry
-          if (attempt < MAX_ATTEMPTS && (!sc || sc === 502 || sc === 503 || sc === 504 || sc === 0)) {
-            await new Promise((r) => setTimeout(r, 1500 + attempt * 1000));
-            continue;
-          }
-          throw e;
-        }
-      }
-
       setGenProgress(100);
-      await openExternalOrBlob(resp, fname);
+
+      const token = getStoredToken();
+      const directFileUrl = (() => {
+        const base = window.location.port === '3000'
+          ? `${window.location.protocol}//${window.location.hostname}:5000/api/jobs/${jobId}/file`
+          : `${API}/jobs/${jobId}/file`;
+        return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+      })();
+
+      const a = document.createElement('a');
+      a.href     = directFileUrl;
+      a.download = fname;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { try { document.body.removeChild(a); } catch(_){} }, 500);
+
       activeJobId.current = null;
       registerDone();
       stopElapsed();
-      addToast(`PDF downloaded (${fmtElapsed(elapsedSecs)})`, 'success');
+      addToast(`PDF download started! Check your Downloads folder. (${fmtElapsed(elapsedSecs)})`, 'success');
     } catch (err) {
       console.error('downloadPDF error:', err?.response?.status, err?.response?.data, err?.message);
       let msg = err?.response?.data?.error || err?.message || 'Download failed';
@@ -1068,7 +1146,7 @@ export default function App() {
         activeJobId.current = null;
       }
     } finally {
-      if (pollTimer) window.clearInterval(pollTimer);
+      if (pollTimer) window.clearTimeout(pollTimer);
       setCardLoading(null);
       setGenProgress(0);
       setGenPhase('');
@@ -1120,25 +1198,64 @@ export default function App() {
         // Poll
         let consecutiveErrors = 0;
         await new Promise((resolve, reject) => {
-          const t = window.setInterval(async () => {
+          let isStopped = false;
+          let t = null;
+          const poll = async () => {
+            if (isStopped) return;
             try {
               const { data } = await axios.get(`${API}/jobs/${jobId}/progress`);
+              if (isStopped) return;
               consecutiveErrors = 0;
               setGenProgress(Math.min(99, Math.round(data.progress || 0)));
               setGenPhase(data.phase || '');
-              if (data.status === 'done')  { jobDoneRef.current = true; window.clearInterval(t); resolve(); }
-              if (data.status === 'error') { window.clearInterval(t); reject(new Error(data.error || 'PDF generation failed')); }
+              if (data.status === 'done')  { jobDoneRef.current = true; isStopped = true; resolve(); return; }
+              if (data.status === 'error') { isStopped = true; reject(new Error(data.error || 'PDF generation failed')); return; }
             } catch {
+              if (isStopped) return;
               consecutiveErrors += 1;
-              if (consecutiveErrors > 200) { window.clearInterval(t); reject(new Error('Connection lost while polling')); }
+              if (consecutiveErrors > 200) { isStopped = true; reject(new Error('Connection lost while polling')); return; }
             }
-          }, 700);
+            t = window.setTimeout(poll, 700);
+          };
+          poll();
         });
 
         setGenPhase('downloading');
-        const resp = await axios.get(`${API}/jobs/${jobId}/file`, {
-          responseType: 'blob',
-          timeout: 30 * 60 * 1000,
+        // v3.7 LARGE-BLOB FIX: same XHR-with-onerror-salvage pattern as downloadPDF.
+        const resp = await new Promise((resolve, reject) => {
+          const token    = getStoredToken();
+          const clientId = getClientId();
+          const xhr = new XMLHttpRequest();
+          xhr.open('GET', `${API}/jobs/${jobId}/file`, true);
+          xhr.responseType = 'blob';
+          xhr.timeout = 30 * 60 * 1000;
+          xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+          if (token)    xhr.setRequestHeader('X-Session-Token', token);
+          if (clientId) xhr.setRequestHeader('X-Client-ID',     clientId);
+
+          const buildResp = (blob, status) => ({
+            status,
+            headers: {
+              'content-type':        xhr.getResponseHeader('content-type') || 'application/pdf',
+              'content-disposition': xhr.getResponseHeader('content-disposition') || '',
+              'content-length':      String(blob.size),
+            },
+            data: blob,
+          });
+
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) resolve(buildResp(xhr.response, xhr.status));
+            else reject(new Error(`Request failed with status ${xhr.status}`));
+          };
+          xhr.onerror = () => {
+            if (xhr.response instanceof Blob && xhr.response.size > 0) {
+              resolve(buildResp(xhr.response, 200));
+            } else {
+              reject(new Error('Network Error'));
+            }
+          };
+          xhr.ontimeout = () => reject(new Error('Request timed out'));
+          xhr.send();
         });
         setGenProgress(100);
         await openExternalOrBlob(resp, 'preview.pdf', (u, ext) => {
@@ -1210,6 +1327,223 @@ export default function App() {
     setModal(null);
   };
 
+  const closeEmpModal = () => {
+    if (empModal?.url && !empModal?.external && empModal.url.startsWith('blob:')) URL.revokeObjectURL(empModal.url);
+    setEmpModal(null);
+  };
+
+  /* ── Employee helpers ── */
+  const startEmpElapsed = useCallback(() => {
+    setEmpElapsedSecs(0);
+    if (empElapsedTimer.current) clearInterval(empElapsedTimer.current);
+    empElapsedTimer.current = setInterval(() => setEmpElapsedSecs((s) => s + 1), 1000);
+  }, []);
+  const stopEmpElapsed = useCallback(() => {
+    if (empElapsedTimer.current) { clearInterval(empElapsedTimer.current); empElapsedTimer.current = null; }
+  }, []);
+
+  const handleEmpFile = async (file) => {
+    if (!file) return;
+    const ext = file.name.split('.').pop()?.toLowerCase();
+    if (!['xlsx', 'xls', 'csv'].includes(ext)) { addToast('Please upload an Excel or CSV file', 'error'); return; }
+    setEmpUploading(true);
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const { data } = await axios.post(`${API}/employees/upload`, fd);
+      const counts = {};
+      (data.classes || []).forEach((c) => { counts[c.class] = c.count; });
+      setEmpStatus({
+        loaded: true,
+        count: data.count,
+        classes: (data.classes || []).map((c) => c.class || c),
+        classCounts: counts,
+        school_name: data.school_name || 'Uploaded File',
+      });
+      setEmpActiveStep(2);
+      setEmpGenDone(false);
+      addToast(`Imported ${data.count} employees`, 'success', 5000);
+    } catch (err) {
+      addToast(err.response?.data?.error || 'Upload failed', 'error');
+    } finally { setEmpUploading(false); }
+  };
+
+  const downloadEmpPDF = async (designation = null) => {
+    if (empCardLoading) return;
+    const key   = designation ? `${designation}_dl` : 'all_dl';
+    const label = designation ? designation : 'All employees';
+    setEmpCardLoading(key);
+    setEmpGenProgress(0);
+    setEmpGenPhase('queued');
+    startEmpElapsed();
+    let jobId = null;
+    try {
+      const startUrl = designation
+        ? `${API}/employees/jobs/start?class=${encodeURIComponent(designation)}&template=${encodeURIComponent(selectedEmpTpl)}`
+        : `${API}/employees/jobs/start?template=${encodeURIComponent(selectedEmpTpl)}`;
+      empJobDoneRef.current = false;
+      let startResp;
+      try { startResp = await axios.post(startUrl, null); }
+      catch { startResp = await axios.get(startUrl); }
+      const startData = startResp.data || {};
+      if (startData.error) throw new Error(startData.error);
+      jobId = startData.job_id;
+      empActiveJobId.current = jobId;
+      const fname = startData.download_name || `employees_${selectedEmpTpl}.pdf`;
+
+      // Poll
+      let consecutive = 0;
+      await new Promise((resolve, reject) => {
+        let stopped = false;
+        const poll = async () => {
+          if (stopped) return;
+          try {
+            const { data } = await axios.get(`${API}/jobs/${jobId}/progress`);
+            if (stopped) return;
+            consecutive = 0;
+            setEmpGenProgress(Math.min(99, Math.round(data.progress || 0)));
+            setEmpGenPhase(data.phase || '');
+            if (data.status === 'done') { empJobDoneRef.current = true; stopped = true; resolve(); return; }
+            if (data.status === 'error') { stopped = true; reject(new Error(data.error || 'Generation failed')); return; }
+          } catch {
+            if (stopped) return;
+            consecutive += 1;
+            if (consecutive > 200) { stopped = true; reject(new Error('Lost connection while waiting')); return; }
+          }
+          window.setTimeout(poll, 700);
+        };
+        poll();
+      });
+
+      // Download with XHR (avoids both axios false-error and fetch unrecoverable-error
+      // on large blobs — see v3.7 comment in downloadPDF)
+      setEmpGenPhase('downloading');
+      const resp = await new Promise((resolve, reject) => {
+        const token    = getStoredToken();
+        const clientId = getClientId();
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', `${API}/jobs/${jobId}/file`, true);
+        xhr.responseType = 'blob';
+        xhr.timeout = 30 * 60 * 1000;
+        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        if (token)    xhr.setRequestHeader('X-Session-Token', token);
+        if (clientId) xhr.setRequestHeader('X-Client-ID',     clientId);
+
+        const buildResp = (blob, status) => ({
+          status,
+          headers: {
+            'content-type':        xhr.getResponseHeader('content-type') || 'application/pdf',
+            'content-disposition': xhr.getResponseHeader('content-disposition') || '',
+            'content-length':      String(blob.size),
+          },
+          data: blob,
+        });
+
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) resolve(buildResp(xhr.response, xhr.status));
+          else { const e = new Error(`Request failed with status ${xhr.status}`); e.response = { status: xhr.status }; reject(e); }
+        };
+        xhr.onerror = () => {
+          if (xhr.response instanceof Blob && xhr.response.size > 0) resolve(buildResp(xhr.response, 200));
+          else reject(new Error('Network Error'));
+        };
+        xhr.ontimeout = () => reject(new Error('Request timed out'));
+        xhr.send();
+      });
+      setEmpGenProgress(100);
+      await openExternalOrBlob(resp, fname);
+      empActiveJobId.current = null;
+      setEmpGenDone(true);
+      stopEmpElapsed();
+      addToast(`Employee PDF downloaded (${fmtElapsed(empElapsedSecs)})`, 'success');
+    } catch (err) {
+      addToast(err?.response?.data?.error || err?.message || 'Download failed', 'error', 8000);
+      if (jobId && !empJobDoneRef.current) {
+        axios.delete(`${API}/jobs/${jobId}`).catch(() => {});
+        empActiveJobId.current = null;
+      }
+    } finally {
+      setEmpCardLoading(null);
+      setEmpGenProgress(0);
+      setEmpGenPhase('');
+      stopEmpElapsed();
+    }
+  };
+
+  // Preview all employees (or by designation) — opens PDF in modal
+  const viewEmpPDF = async (designation = null) => {
+    if (empCardLoading) return;
+    const key = designation ? `${designation}_view` : 'all_view';
+    setEmpCardLoading(key);
+    try {
+      const url = designation
+        ? `${API}/employees/preview/all?class=${encodeURIComponent(designation)}&template=${encodeURIComponent(selectedEmpTpl)}`
+        : `${API}/employees/preview/all?template=${encodeURIComponent(selectedEmpTpl)}`;
+      const resp = await axios.get(url, { responseType: 'blob', timeout: 10 * 60 * 1000 });
+      await openExternalOrBlob(resp, 'preview_employees.pdf', (u, ext) =>
+        setEmpModal({ url: u, title: designation ? `${designation} — Preview` : 'All Employees — Preview', external: ext }));
+    } catch (err) {
+      addToast(err?.response?.data?.error || err?.message || 'Preview failed', 'error', 6000);
+    } finally {
+      setEmpCardLoading(null);
+    }
+  };
+
+  // Fetch employee names for a given designation (for individual card panel)
+  const loadEmpNames = async (desig) => {
+    setEmpDesigFilter(desig);
+    setEmpSelectedName('');
+    setEmpNameOptions([]);
+    if (!desig) return;
+    try {
+      const { data } = await axios.get(`${API}/employees/list?class=${encodeURIComponent(desig)}`);
+      const names = (data || []).map((e) => e.employee_name || e.name || '').filter(Boolean);
+      setEmpNameOptions(names);
+    } catch {
+      setEmpNameOptions([]);
+    }
+  };
+
+  // Preview a single employee card
+  const viewEmpEmployee = async () => {
+    if (!empDesigFilter || !empSelectedName) { addToast('Select designation and employee', 'error'); return; }
+    setEmpIndivLoading('view');
+    try {
+      const resp = await axios.get(
+        `${API}/employees/preview/student?class=${encodeURIComponent(empDesigFilter)}&name=${encodeURIComponent(empSelectedName)}&template=${encodeURIComponent(selectedEmpTpl)}`,
+        { responseType: 'blob', timeout: 10 * 60 * 1000 },
+      );
+      await openExternalOrBlob(resp, 'preview_employee.pdf', (u, ext) =>
+        setEmpModal({ url: u, title: `${empSelectedName} — Preview`, external: ext }));
+    } catch (err) {
+      addToast(err?.response?.data?.error || 'Preview failed', 'error');
+    } finally { setEmpIndivLoading(null); }
+  };
+
+  // Download a single employee card
+  const downloadEmpEmployee = async () => {
+    if (!empDesigFilter || !empSelectedName) { addToast('Select designation and employee', 'error'); return; }
+    setEmpIndivLoading('download');
+    try {
+      const resp = await axios.get(
+        `${API}/employees/download/student?class=${encodeURIComponent(empDesigFilter)}&name=${encodeURIComponent(empSelectedName)}&template=${encodeURIComponent(selectedEmpTpl)}`,
+        { responseType: 'blob', timeout: 10 * 60 * 1000 },
+      );
+      await openExternalOrBlob(resp, `employee_${empSelectedName.replace(/\s+/g, '_')}.pdf`);
+      addToast('Employee card downloaded', 'success');
+    } catch (err) {
+      addToast(err?.response?.data?.error || 'Download failed', 'error');
+    } finally { setEmpIndivLoading(null); }
+  };
+
+  const activeEmpTemplate = empTemplates.find((t) => t.key === selectedEmpTpl) || empTemplates[0];
+  const empFilteredDesignations = useMemo(() => {
+    const q = empSearchQuery.trim().toLowerCase();
+    return q
+      ? (empStatus.classes || []).filter((c) => String(c).toLowerCase().includes(q))
+      : (empStatus.classes || []);
+  }, [empSearchQuery, empStatus.classes]);
+
   const confirmTemplate = () => {
     setTemplateConfirmed(true);
     setActiveStep(1);
@@ -1217,16 +1551,30 @@ export default function App() {
   };
 
   const resetWorkflow = () => {
-    // cancel any running job
+    // cancel any running student job
     if (activeJobId.current) {
       axios.delete(`${API}/jobs/${activeJobId.current}`).catch(() => {});
       activeJobId.current = null;
     }
+    // cancel any running employee job
+    if (empActiveJobId.current) {
+      axios.delete(`${API}/jobs/${empActiveJobId.current}`).catch(() => {});
+      empActiveJobId.current = null;
+    }
     stopElapsed();
+    stopEmpElapsed();
+    // reset student state
     setStatus(INITIAL_STATUS); setTemplateConfirmed(false); setSelectedSchool('');
     setDataSource('file'); setStudentClass(''); setStudentName(''); setStudentNames([]);
     setSearchQuery(''); setShowAdvanced(false); setGenerationDone(false); setActiveStep(0);
     setCardLoading(null); setGenProgress(0); setGenPhase(''); setGenLabel('');
+    // reset employee state
+    setEmpStatus({ loaded: false, count: 0, classes: [], classCounts: {} });
+    setEmpTplConfirmed(false); setEmpActiveStep(0); setEmpGenDone(false);
+    setEmpCardLoading(null); setEmpGenProgress(0); setEmpGenPhase('');
+    setEmpSearchQuery(''); setShowEmpAdvanced(false);
+    setEmpDesigFilter(''); setEmpSelectedName(''); setEmpNameOptions([]);
+    setEmpIndivLoading(null);
     addToast('Workflow reset', 'info');
   };
 
@@ -1250,9 +1598,11 @@ export default function App() {
     return (
       <LoginScreen
         initialSeats={initialSeats}
+        initialError={loginScreenError}
         onSuccess={(data) => {
           setInitialSeats({ active: data.active_users, max: data.max_users });
           setAuthed(true);
+          setLoginScreenError('');
         }}
       />
     );
@@ -1264,7 +1614,8 @@ export default function App() {
   return (
     <div className="app-shell">
       <Toast toasts={toasts} removeToast={removeToast} />
-      {modal && <PDFModal url={modal.url} title={modal.title} external={modal.external} onClose={closeModal} />}
+      {modal    && <PDFModal url={modal.url}    title={modal.title}    external={modal.external}    onClose={closeModal} />}
+      {empModal && <PDFModal url={empModal.url} title={empModal.title} external={empModal.external} onClose={closeEmpModal} />}
 
       {/* ── v3.1: red banner when server is memory-pressured ── */}
       {ramRefuse && (
@@ -1291,6 +1642,15 @@ export default function App() {
         </div>
         <div className="topbar-right">
           <SystemMonitor stats={sysStats} />
+          {/* ── Students / Employees mode toggle ── */}
+          <div className="mode-tabs">
+            <button className={`mode-tab ${mode === 'students' ? 'active' : ''}`} onClick={() => setMode('students')}>
+              <GraduationCap size={13} /> Students
+            </button>
+            <button className={`mode-tab ${mode === 'employees' ? 'active' : ''}`} onClick={() => setMode('employees')}>
+              <Users size={13} /> Employees
+            </button>
+          </div>
           <div className={`backend-pill ${backendOk === true ? 'ok' : backendOk === false ? 'err' : ''}`}>
             {backendOk === true  && <><span className="status-dot" /> Connected</>}
             {backendOk === false && <><AlertCircle size={13} /> Offline</>}
@@ -1301,7 +1661,8 @@ export default function App() {
         </div>
       </header>
 
-      {/* ── Wizard outer ── */}
+      {/* ── Students wizard ── */}
+      {mode === 'students' && (
       <div className="wizard-outer">
 
         {/* ── Step progress track ── */}
@@ -1626,6 +1987,256 @@ export default function App() {
           </div>
         )}
       </div>
+      )} {/* end mode === 'students' */}
+
+      {/* ══════════════════════════════════════════════════════
+          EMPLOYEES SECTION
+          ══════════════════════════════════════════════════════ */}
+      {mode === 'employees' && (
+      <div className="wizard-outer">
+
+        {/* Step progress track */}
+        <div className="step-track">
+          {['Select Template', 'Upload Data', 'Generate'].map((label, i) => {
+            const dones = [empTplConfirmed, empStatus.loaded, empGenDone];
+            const canGo = i === 0 ? true : i === 1 ? empTplConfirmed : empTplConfirmed && empStatus.loaded;
+            return (
+              <React.Fragment key={label}>
+                {i > 0 && (
+                  <div className="step-connector">
+                    <div className="step-connector-fill" style={{ width: (i === 1 ? empTplConfirmed : empTplConfirmed && empStatus.loaded) ? '100%' : '0%' }} />
+                  </div>
+                )}
+                <button
+                  className={`step-node ${empActiveStep === i ? 'active' : ''} ${dones[i] ? 'done' : ''}`}
+                  onClick={() => canGo && setEmpActiveStep(i)}
+                  disabled={!canGo}
+                >
+                  <div className="step-bubble">{dones[i] ? <CheckCircle2 size={16} /> : i + 1}</div>
+                  <span className="step-label">{label}</span>
+                </button>
+              </React.Fragment>
+            );
+          })}
+        </div>
+
+        {/* ── STEP 1: Select employee template ── */}
+        {empActiveStep === 0 && (
+          <div className="wizard-card" style={{ animation: 'slideFade .22s ease' }}>
+            <div className="wizard-card-header">
+              <div className="wizard-card-header-left">
+                <div className={`wizard-step-badge ${empTplConfirmed ? 'done' : ''}`}>01</div>
+                <div>
+                  <div className="wizard-card-title">Choose employee card layout</div>
+                  <div className="wizard-card-subtitle">Pick the design for your school's employee ID cards</div>
+                </div>
+              </div>
+              {empTplConfirmed && <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--success)', display: 'flex', alignItems: 'center', gap: 5 }}><CheckCircle2 size={14} /> Done</span>}
+            </div>
+            <div className="wizard-card-body">
+              <div className="template-scroll">
+                {empLoadingTpls
+                  ? [0, 1].map((i) => <TplSkeleton key={i} />)
+                  : empTemplates.length === 0
+                    ? <div className="empty-state"><AlertCircle size={20} /><p>No employee templates found. Check the backend is running.</p></div>
+                    : empTemplates.map((t) => (
+                      <TemplateCard key={t.key} template={t} chosen={selectedEmpTpl === t.key} onSelect={setSelectedEmpTpl} />
+                    ))}
+              </div>
+            </div>
+            <div className="wizard-card-footer">
+              <span style={{ fontSize: 13, color: 'var(--text-2)' }}>
+                Selected: <strong>{activeEmpTemplate?.label || '—'}</strong>
+              </span>
+              <button className="btn btn-primary btn-lg"
+                onClick={() => { setEmpTplConfirmed(true); setEmpActiveStep(1); addToast(`Template set: ${activeEmpTemplate?.label}`, 'success'); }}
+                disabled={!selectedEmpTpl}
+              >
+                Continue with {activeEmpTemplate?.label || 'template'} →
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ── STEP 2: Upload employee file ── */}
+        {empActiveStep === 1 && (
+          <div className="wizard-card" style={{ animation: 'slideFade .22s ease' }}>
+            <div className="wizard-card-header">
+              <div className="wizard-card-header-left">
+                <div className={`wizard-step-badge ${empStatus.loaded ? 'done' : ''}`}>02</div>
+                <div>
+                  <div className="wizard-card-title">Upload employee data</div>
+                  <div className="wizard-card-subtitle">Excel or CSV with columns: name, designation, emp_id, photo_url, etc.</div>
+                </div>
+              </div>
+              {empStatus.loaded && <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--success)', display: 'flex', alignItems: 'center', gap: 5 }}><CheckCircle2 size={14} /> {empStatus.count} employees loaded</span>}
+            </div>
+            <div className="wizard-card-body">
+              <div
+                className={`dropzone ${empUploading ? 'uploading' : ''}`}
+                onClick={() => !empUploading && empFileRef.current?.click()}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => { e.preventDefault(); handleEmpFile(e.dataTransfer.files[0]); }}
+              >
+                <input ref={empFileRef} type="file" accept=".xlsx,.xls,.csv" hidden onChange={(e) => handleEmpFile(e.target.files[0])} />
+                {empUploading ? (
+                  <>
+                    <Loader2 size={32} className="spin-icon" style={{ color: 'var(--primary)' }} />
+                    <div className="dropzone-title">Parsing employee data<Dots /></div>
+                    <div className="dropzone-sub">Reading rows and grouping by designation…</div>
+                  </>
+                ) : (
+                  <>
+                    <div className="dropzone-icon"><Upload size={22} /></div>
+                    <div className="dropzone-title">Drop your employee spreadsheet here</div>
+                    <div className="dropzone-sub">Columns: name, designation, emp_id, dob, mobile, address, photo_url</div>
+                  </>
+                )}
+              </div>
+              {empStatus.loaded && (
+                <div className="load-success">
+                  <div className="load-success-icon"><CheckCircle2 size={18} /></div>
+                  <div>
+                    <strong>{empStatus.count} employees loaded</strong>
+                    <p>{(empStatus.classes || []).length} designations · {empStatus.school_name || 'Uploaded file'}</p>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="wizard-card-footer">
+              <button className="btn btn-ghost btn-sm" onClick={() => setEmpActiveStep(0)}>← Back</button>
+              <button className="btn btn-primary btn-lg" onClick={() => setEmpActiveStep(2)} disabled={!empStatus.loaded}>
+                Continue to Generate →
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ── STEP 3: Generate employee ID cards ── */}
+        {empActiveStep === 2 && (
+          <div className="wizard-card" style={{ animation: 'slideFade .22s ease' }}>
+            <div className="wizard-card-header">
+              <div className="wizard-card-header-left">
+                <div className={`wizard-step-badge ${empGenDone ? 'done' : ''}`}>03</div>
+                <div>
+                  <div className="wizard-card-title">Generate Employee ID cards</div>
+                  <div className="wizard-card-subtitle">
+                    {activeEmpTemplate?.label} · {empStatus.count} employees · {(empStatus.classes || []).length} designations
+                  </div>
+                </div>
+              </div>
+              {empGenDone && <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--success)', display: 'flex', alignItems: 'center', gap: 5 }}><CheckCircle2 size={14} /> Exported</span>}
+            </div>
+            <div className="wizard-card-body">
+              {/* Hero action */}
+              <div className="gen-hero">
+                <div>
+                  <h3>Export all employee ID cards</h3>
+                  <p>Download the full batch using <strong>{activeEmpTemplate?.label}</strong> template</p>
+                </div>
+                <div className="gen-actions">
+                  <button className="btn btn-primary btn-lg" onClick={() => downloadEmpPDF(null)} disabled={!!empCardLoading}>
+                    {empCardLoading === 'all_dl'
+                      ? <><span className="btn-spinner" /> Generating…</>
+                      : <><Download size={15} /> Download all</>}
+                  </button>
+                  <button className="btn btn-secondary btn-lg" onClick={() => viewEmpPDF(null)} disabled={!!empCardLoading}>
+                    {empCardLoading === 'all_view'
+                      ? <><span className="btn-spinner" /> Loading…</>
+                      : <><Eye size={15} /> Preview all</>}
+                  </button>
+                </div>
+              </div>
+
+              {/* Progress bar */}
+              {empCardLoading && (
+                <div className="status-banner">
+                  <Loader2 size={15} className="spin-icon" />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ marginBottom: 4 }}>{phaseMap[empGenPhase] || empGenPhase || 'Processing…'} ({empElapsedSecs}s)</div>
+                    {empGenProgress > 0 && (
+                      <div style={{ height: 7, width: '100%', background: 'rgba(0,0,0,0.08)', borderRadius: 999, overflow: 'hidden' }}>
+                        <div style={{ width: `${empGenProgress}%`, height: '100%', background: 'var(--primary, #4F46E5)', transition: 'width 300ms ease', borderRadius: 999 }} />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Search + filter row */}
+              <div className="tools-row">
+                <div className="search-field">
+                  <Search size={15} />
+                  <input type="text" value={empSearchQuery} onChange={(e) => setEmpSearchQuery(e.target.value)} placeholder="Filter by designation…" />
+                </div>
+                <button className="btn btn-secondary btn-sm" onClick={() => setShowEmpAdvanced((p) => !p)}>
+                  <Filter size={14} /> {showEmpAdvanced ? 'Hide' : 'Individual card'}
+                </button>
+              </div>
+
+              <div className="class-grid">
+                {empFilteredDesignations.length ? empFilteredDesignations.map((des) => (
+                  <ClassCard
+                    key={des}
+                    cls={des}
+                    count={empStatus.classCounts?.[des] ?? '?'}
+                    onDownload={downloadEmpPDF}
+                    onView={viewEmpPDF}
+                    loading={empCardLoading}
+                  />
+                )) : (
+                  <div className="empty-state"><Search size={20} /><p>No designations match your filter</p></div>
+                )}
+              </div>
+
+              {/* Individual employee card panel */}
+              {showEmpAdvanced && (
+                <div className="advanced-panel">
+                  <div className="advanced-title">Generate individual employee card</div>
+                  <div className="student-row">
+                    <div className="form-group">
+                      <label className="form-label">Designation</label>
+                      <div className="custom-select">
+                        <select value={empDesigFilter} onChange={(e) => loadEmpNames(e.target.value)}>
+                          <option value="">Choose designation…</option>
+                          {(empStatus.classes || []).map((d) => <option key={d} value={d}>{d}</option>)}
+                        </select>
+                        <ChevronDown size={14} className="select-arrow" />
+                      </div>
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">Employee</label>
+                      <div className="custom-select">
+                        <select value={empSelectedName} onChange={(e) => setEmpSelectedName(e.target.value)} disabled={!empDesigFilter || empNameOptions.length === 0}>
+                          <option value="">{!empDesigFilter ? 'Select designation first' : empNameOptions.length === 0 ? 'No employees found' : 'Choose employee…'}</option>
+                          {empNameOptions.map((n) => <option key={n} value={n}>{n}</option>)}
+                        </select>
+                        <ChevronDown size={14} className="select-arrow" />
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                    <button className="btn btn-secondary" onClick={viewEmpEmployee} disabled={!empSelectedName || !!empIndivLoading || !!empCardLoading}>
+                      {empIndivLoading === 'view' ? <><span className="btn-spinner" /> Loading…</> : <><Eye size={14} /> Preview</>}
+                    </button>
+                    <button className="btn btn-primary" onClick={downloadEmpEmployee} disabled={!empSelectedName || !!empIndivLoading || !!empCardLoading}>
+                      {empIndivLoading === 'download' ? <><span className="btn-spinner" /> Generating…</> : <><Download size={14} /> Download</>}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="wizard-card-footer">
+              <button className="btn btn-ghost btn-sm" onClick={() => setEmpActiveStep(1)}>← Back</button>
+              <span style={{ fontSize: 13, color: 'var(--text-3)' }}>
+                {empGenDone ? '✓ Cards exported' : `${(empStatus.classes || []).length} designations ready`}
+              </span>
+            </div>
+          </div>
+        )}
+      </div>
+      )} {/* end mode === 'employees' */}
+
     </div>
   );
 }
