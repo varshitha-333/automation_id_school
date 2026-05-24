@@ -87,6 +87,10 @@ axios.defaults.headers.common['X-Requested-With'] = 'XMLHttpRequest';
    ─────────────────────────────────────────────────────────── */
 const SESSION_KEY = 'idcard_session_token';
 const CLIENT_KEY  = 'idcard_client_id';
+// Stores the last-used access code in memory (never persisted) so we can
+// silently re-login when a SESSION_TIMEOUT error arrives, without forcing
+// the user back to the login screen if they're actively working.
+let _inMemoryCode = '';
 
 function getStoredToken() {
   try { return localStorage.getItem(SESSION_KEY) || ''; }
@@ -430,6 +434,7 @@ function LoginScreen({ onSuccess, initialSeats, initialError }) {
           client_id:    clientId },
         { headers: { 'X-Client-ID': clientId } });
       if (data?.session_token) {
+        _inMemoryCode = code.trim();   // remember for silent re-login
         setStoredToken(data.session_token);
         onSuccess(data);
       } else {
@@ -709,21 +714,42 @@ export default function App() {
   useEffect(() => {
     const id = axios.interceptors.response.use(
       (resp) => resp,
-      (err) => {
+      async (err) => {
         const r = err?.response;
-        if (
-          r?.status === 401 &&
-          (r.data?.code === 'NO_SESSION' || r.data?.code === 'BAD_SESSION' || r.data?.code === 'SESSION_TIMEOUT')
-        ) {
-          setStoredToken('');
-          setAuthed(false);
-          setSysStats(null);
-          if (r.data?.code === 'SESSION_TIMEOUT') {
-            setLoginScreenError('Your session has expired due to 15 minutes of inactivity. Please log in again.');
-            addToast('Your session has expired due to 15 minutes of inactivity. Please log in again.', 'error', 6000);
-          } else {
-            setLoginScreenError('Your session has expired or is invalid. Please log in again.');
-            addToast('Your session has expired or is invalid. Please log in again.', 'error', 6000);
+        if (r?.status === 401) {
+          const code = r.data?.code;
+
+          if (code === 'SESSION_TIMEOUT' && _inMemoryCode) {
+            // Session timed out but we know the access code — silently renew
+            // the session without kicking the user back to the login screen.
+            try {
+              const clientId = getClientId();
+              const { data } = await axios.post(`${API}/login`,
+                { code: _inMemoryCode, client_id: clientId },
+                { headers: { 'X-Client-ID': clientId } });
+              if (data?.session_token) {
+                setStoredToken(data.session_token);
+                // Retry the original failed request with the new token
+                const originalReq = err.config;
+                originalReq.headers['X-Session-Token'] = data.session_token;
+                return axios(originalReq);
+              }
+            } catch (_silentErr) {
+              // Silent renewal failed — fall through to login screen
+            }
+          }
+
+          if (code === 'NO_SESSION' || code === 'BAD_SESSION' || code === 'SESSION_TIMEOUT') {
+            setStoredToken('');
+            setAuthed(false);
+            setSysStats(null);
+            if (code === 'SESSION_TIMEOUT') {
+              setLoginScreenError('Your session has expired due to inactivity. Please log in again.');
+              addToast('Your session has expired due to inactivity. Please log in again.', 'error', 6000);
+            } else {
+              setLoginScreenError('Your session has expired or is invalid. Please log in again.');
+              addToast('Your session has expired or is invalid. Please log in again.', 'error', 6000);
+            }
           }
         }
         return Promise.reject(err);
