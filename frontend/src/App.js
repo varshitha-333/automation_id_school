@@ -87,10 +87,6 @@ axios.defaults.headers.common['X-Requested-With'] = 'XMLHttpRequest';
    ─────────────────────────────────────────────────────────── */
 const SESSION_KEY = 'idcard_session_token';
 const CLIENT_KEY  = 'idcard_client_id';
-// Stores the last-used access code in memory (never persisted) so we can
-// silently re-login when a SESSION_TIMEOUT error arrives, without forcing
-// the user back to the login screen if they're actively working.
-let _inMemoryCode = '';
 
 function getStoredToken() {
   try { return localStorage.getItem(SESSION_KEY) || ''; }
@@ -434,7 +430,6 @@ function LoginScreen({ onSuccess, initialSeats, initialError }) {
           client_id:    clientId },
         { headers: { 'X-Client-ID': clientId } });
       if (data?.session_token) {
-        _inMemoryCode = code.trim();   // remember for silent re-login
         setStoredToken(data.session_token);
         onSuccess(data);
       } else {
@@ -623,6 +618,11 @@ export default function App() {
   const empActiveJobId   = useRef(null);
   const empJobDoneRef    = useRef(false);
 
+  const [zipFormat,          setZipFormat]          = useState('pdf');   // 'pdf' | 'jpeg'
+  const [showZipFmtMenu,    setShowZipFmtMenu]    = useState(false);
+  const [empZipFormat,      setEmpZipFormat]      = useState('pdf');
+  const [showEmpZipFmtMenu, setShowEmpZipFmtMenu] = useState(false);
+
   const fileRef      = useRef(null);
   const toastIdRef   = useRef(0);
   const elapsedTimer = useRef(null);   // interval for wall-clock counter
@@ -648,6 +648,19 @@ export default function App() {
     setToasts((prev) => prev.map((t) => t.id === id ? { ...t, leaving: true } : t));
     window.setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 350);
   }, []);
+
+  /* ── Close ZIP format menus on outside click ── */
+  useEffect(() => {
+    if (!showZipFmtMenu && !showEmpZipFmtMenu) return;
+    const handler = (e) => {
+      if (!e.target.closest('.zip-split-btn')) {
+        setShowZipFmtMenu(false);
+        setShowEmpZipFmtMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showZipFmtMenu, showEmpZipFmtMenu]);
 
   /* cleanup on unmount */
   useEffect(() => {
@@ -714,42 +727,21 @@ export default function App() {
   useEffect(() => {
     const id = axios.interceptors.response.use(
       (resp) => resp,
-      async (err) => {
+      (err) => {
         const r = err?.response;
-        if (r?.status === 401) {
-          const code = r.data?.code;
-
-          if (code === 'SESSION_TIMEOUT' && _inMemoryCode) {
-            // Session timed out but we know the access code — silently renew
-            // the session without kicking the user back to the login screen.
-            try {
-              const clientId = getClientId();
-              const { data } = await axios.post(`${API}/login`,
-                { code: _inMemoryCode, client_id: clientId },
-                { headers: { 'X-Client-ID': clientId } });
-              if (data?.session_token) {
-                setStoredToken(data.session_token);
-                // Retry the original failed request with the new token
-                const originalReq = err.config;
-                originalReq.headers['X-Session-Token'] = data.session_token;
-                return axios(originalReq);
-              }
-            } catch (_silentErr) {
-              // Silent renewal failed — fall through to login screen
-            }
-          }
-
-          if (code === 'NO_SESSION' || code === 'BAD_SESSION' || code === 'SESSION_TIMEOUT') {
-            setStoredToken('');
-            setAuthed(false);
-            setSysStats(null);
-            if (code === 'SESSION_TIMEOUT') {
-              setLoginScreenError('Your session has expired due to inactivity. Please log in again.');
-              addToast('Your session has expired due to inactivity. Please log in again.', 'error', 6000);
-            } else {
-              setLoginScreenError('Your session has expired or is invalid. Please log in again.');
-              addToast('Your session has expired or is invalid. Please log in again.', 'error', 6000);
-            }
+        if (
+          r?.status === 401 &&
+          (r.data?.code === 'NO_SESSION' || r.data?.code === 'BAD_SESSION' || r.data?.code === 'SESSION_TIMEOUT')
+        ) {
+          setStoredToken('');
+          setAuthed(false);
+          setSysStats(null);
+          if (r.data?.code === 'SESSION_TIMEOUT') {
+            setLoginScreenError('Your session has expired due to 15 minutes of inactivity. Please log in again.');
+            addToast('Your session has expired due to 15 minutes of inactivity. Please log in again.', 'error', 6000);
+          } else {
+            setLoginScreenError('Your session has expired or is invalid. Please log in again.');
+            addToast('Your session has expired or is invalid. Please log in again.', 'error', 6000);
           }
         }
         return Promise.reject(err);
@@ -1348,6 +1340,189 @@ export default function App() {
     } finally { setStudentLoading(null); stopElapsed(); }
   };
 
+  const downloadZip = async (cls = null, fmt = zipFormat) => {
+    if (cardLoading || studentLoading) return;
+
+    const key   = cls ? `${cls}_zip` : 'all_zip';
+    const label = cls ? `Class ${cls} ZIP` : 'All students ZIP';
+    setCardLoading(key);
+    setGenProgress(0);
+    setGenPhase('queued');
+    setGenLabel(label);
+    startElapsed();
+
+    let jobId = null;
+    let pollTimer = null;
+
+    try {
+      // 1) Start the ZIP job
+      const startUrl = cls
+        ? `${API}/jobs/start-zip?class=${encodeURIComponent(cls)}&template=${encodeURIComponent(selectedTemplate)}&format=${encodeURIComponent(fmt)}`
+        : `${API}/jobs/start-zip?template=${encodeURIComponent(selectedTemplate)}&format=${encodeURIComponent(fmt)}`;
+
+      jobDoneRef.current = false;
+      let startResp;
+      try { startResp = await axios.post(startUrl, null); }
+      catch { startResp = await axios.get(startUrl); }
+
+      const startData = startResp.data || {};
+      if (startData.error) throw new Error(startData.error);
+      jobId = startData.job_id;
+      activeJobId.current = jobId;
+      const fname = startData.download_name || `student_id_cards_${selectedTemplate}.zip`;
+
+      // 2) Poll progress
+      let consecutiveErrors = 0;
+      await new Promise((resolve, reject) => {
+        let isStopped = false;
+        const poll = async () => {
+          if (isStopped) return;
+          try {
+            const { data } = await axios.get(`${API}/jobs/${jobId}/progress`);
+            if (isStopped) return;
+            consecutiveErrors = 0;
+            setGenProgress(Math.min(99, Math.round(data.progress || 0)));
+            setGenPhase(data.phase || '');
+            if (data.status === 'done') { jobDoneRef.current = true; isStopped = true; resolve(); return; }
+            if (data.status === 'error') { isStopped = true; reject(new Error(data.error || 'ZIP generation failed')); return; }
+          } catch {
+            if (isStopped) return;
+            consecutiveErrors += 1;
+            if (consecutiveErrors > 200) { isStopped = true; reject(new Error('Lost connection while building ZIP')); return; }
+          }
+          pollTimer = window.setTimeout(poll, 700);
+        };
+        poll();
+      });
+
+      // 3) Download the finished ZIP via native <a> (no size limit)
+      setGenPhase('downloading');
+      setGenProgress(100);
+
+      const token = getStoredToken();
+      const baseZipUrl = window.location.port === '3000'
+        ? `${window.location.protocol}//${window.location.hostname}:5000/api/jobs/${jobId}/zip-file`
+        : `${API}/jobs/${jobId}/zip-file`;
+      const zipUrl = token ? `${baseZipUrl}?token=${encodeURIComponent(token)}` : baseZipUrl;
+
+      const a = document.createElement('a');
+      a.href = zipUrl;
+      a.download = fname;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { try { document.body.removeChild(a); } catch (_) {} }, 500);
+
+      activeJobId.current = null;
+      registerDone();
+      stopElapsed();
+      addToast(`ZIP download started! Each student has their own ${fmt === "jpeg" ? "PNG (lossless)" : "PDF"} inside. (${fmtElapsed(elapsedSecs)})`, 'success', 7000);
+    } catch (err) {
+      addToast(err?.response?.data?.error || err?.message || 'ZIP download failed', 'error', 8000);
+      if (jobId && !jobDoneRef.current) {
+        axios.delete(`${API}/jobs/${jobId}`).catch(() => {});
+        activeJobId.current = null;
+      }
+    } finally {
+      if (pollTimer) window.clearTimeout(pollTimer);
+      setCardLoading(null);
+      setGenProgress(0);
+      setGenPhase('');
+      setGenLabel('');
+      stopElapsed();
+    }
+  };
+
+  const downloadEmpZip = async (designation = null, fmt = empZipFormat) => {
+    if (empCardLoading) return;
+
+    const key   = designation ? `${designation}_zip` : 'all_emp_zip';
+    setEmpCardLoading(key);
+    setEmpGenProgress(0);
+    setEmpGenPhase('queued');
+    startEmpElapsed();
+
+    let jobId = null;
+    let pollTimer = null;
+
+    try {
+      // 1) Start the employee ZIP job
+      const startUrl = designation
+        ? `${API}/employees/jobs/start-zip?class=${encodeURIComponent(designation)}&template=${encodeURIComponent(selectedEmpTpl)}&format=${encodeURIComponent(fmt)}`
+        : `${API}/employees/jobs/start-zip?template=${encodeURIComponent(selectedEmpTpl)}&format=${encodeURIComponent(fmt)}`;
+
+      empJobDoneRef.current = false;
+      let startResp;
+      try { startResp = await axios.post(startUrl, null); }
+      catch { startResp = await axios.get(startUrl); }
+
+      const startData = startResp.data || {};
+      if (startData.error) throw new Error(startData.error);
+      jobId = startData.job_id;
+      empActiveJobId.current = jobId;
+      const fname = startData.download_name || `employees_individual.zip`;
+
+      // 2) Poll progress
+      let consecutive = 0;
+      await new Promise((resolve, reject) => {
+        let stopped = false;
+        const poll = async () => {
+          if (stopped) return;
+          try {
+            const { data } = await axios.get(`${API}/jobs/${jobId}/progress`);
+            if (stopped) return;
+            consecutive = 0;
+            setEmpGenProgress(Math.min(99, Math.round(data.progress || 0)));
+            setEmpGenPhase(data.phase || '');
+            if (data.status === 'done') { empJobDoneRef.current = true; stopped = true; resolve(); return; }
+            if (data.status === 'error') { stopped = true; reject(new Error(data.error || 'ZIP generation failed')); return; }
+          } catch {
+            if (stopped) return;
+            consecutive += 1;
+            if (consecutive > 200) { stopped = true; reject(new Error('Lost connection while building ZIP')); return; }
+          }
+          pollTimer = window.setTimeout(poll, 700);
+        };
+        poll();
+      });
+
+      // 3) Download via native <a>
+      setEmpGenPhase('downloading');
+      setEmpGenProgress(100);
+
+      const token = getStoredToken();
+      const baseZipUrl = window.location.port === '3000'
+        ? `${window.location.protocol}//${window.location.hostname}:5000/api/jobs/${jobId}/zip-file`
+        : `${API}/jobs/${jobId}/zip-file`;
+      const zipUrl = token ? `${baseZipUrl}?token=${encodeURIComponent(token)}` : baseZipUrl;
+
+      const a = document.createElement('a');
+      a.href = zipUrl;
+      a.download = fname;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { try { document.body.removeChild(a); } catch (_) {} }, 500);
+
+      empActiveJobId.current = null;
+      setEmpGenDone(true);
+      stopEmpElapsed();
+      addToast(`Employee ZIP download started! Each employee has their own ${fmt === "jpeg" ? "PNG (lossless)" : "PDF"} inside. (${fmtElapsed(empElapsedSecs)})`, 'success', 7000);
+    } catch (err) {
+      addToast(err?.response?.data?.error || err?.message || 'Employee ZIP download failed', 'error', 8000);
+      if (jobId && !empJobDoneRef.current) {
+        axios.delete(`${API}/jobs/${jobId}`).catch(() => {});
+        empActiveJobId.current = null;
+      }
+    } finally {
+      if (pollTimer) window.clearTimeout(pollTimer);
+      setEmpCardLoading(null);
+      setEmpGenProgress(0);
+      setEmpGenPhase('');
+      stopEmpElapsed();
+    }
+  };
+
   const closeModal = () => {
     if (modal?.url && !modal?.external && modal.url.startsWith('blob:')) URL.revokeObjectURL(modal.url);
     setModal(null);
@@ -1903,6 +2078,61 @@ export default function App() {
                       ? <><span className="btn-spinner" /> Loading…</>
                       : <><Eye size={15} /> Preview all</>}
                   </button>
+                  <div className="zip-split-btn" style={{ position: 'relative', display: 'inline-flex' }}>
+                    <button
+                      className="btn btn-secondary btn-lg zip-main"
+                      onClick={() => { setShowZipFmtMenu(false); downloadZip(null, zipFormat); }}
+                      disabled={!!cardLoading || !!studentLoading}
+                      title={`Download one ${zipFormat === "jpeg" ? "PNG (lossless)" : "PDF"} per student, packed into a ZIP`}
+                      style={{ borderRadius: '8px 0 0 8px', paddingRight: 10 }}
+                    >
+                      {cardLoading === 'all_zip'
+                        ? (genPhase === 'downloading'
+                            ? <><span className="btn-spinner" /> Downloading…</>
+                            : genPhase === 'prefetch'
+                            ? <><span className="btn-spinner" /> Fetching photos…</>
+                            : <><span className="btn-spinner" /> Packing {genProgress > 0 ? `${genProgress}%` : '…'}</>)
+                        : <><Download size={15} /> Download ZIP ({zipFormat === 'jpeg' ? 'PNG' : 'PDF'})</>}
+                    </button>
+                    <button
+                      className="btn btn-secondary btn-lg zip-arrow"
+                      onClick={() => setShowZipFmtMenu((v) => !v)}
+                      disabled={!!cardLoading || !!studentLoading}
+                      title="Choose ZIP format"
+                      style={{ borderRadius: '0 8px 8px 0', borderLeft: '1px solid rgba(0,0,0,0.15)', paddingLeft: 8, paddingRight: 8 }}
+                    >
+                      <ChevronDown size={14} />
+                    </button>
+                    {showZipFmtMenu && (
+                      <div className="zip-fmt-menu" style={{
+                        position: 'absolute', top: '110%', right: 0, zIndex: 200,
+                        background: 'var(--surface)', border: '1px solid var(--border)',
+                        borderRadius: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.13)',
+                        minWidth: 170, overflow: 'hidden',
+                      }}>
+                        <div style={{ padding: '6px 0' }}>
+                          {[
+                            { val: 'pdf',  label: '📄 PDF', sub: 'Vector — smallest file' },
+                            { val: 'jpeg', label: '🖼️ PNG', sub: '8K lossless PNG — print & zoom proof' },
+                          ].map(({ val, label, sub }) => (
+                            <button
+                              key={val}
+                              onClick={() => { setZipFormat(val); setShowZipFmtMenu(false); }}
+                              style={{
+                                display: 'block', width: '100%', textAlign: 'left',
+                                padding: '8px 14px', border: 'none', cursor: 'pointer',
+                                background: zipFormat === val ? 'var(--primary-10, #eef2ff)' : 'transparent',
+                                color: 'var(--text-1)',
+                              }}
+                            >
+                              <div style={{ fontWeight: 600, fontSize: 13 }}>{label}</div>
+                              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 1 }}>{sub}</div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -2171,6 +2401,61 @@ export default function App() {
                       ? <><span className="btn-spinner" /> Loading…</>
                       : <><Eye size={15} /> Preview all</>}
                   </button>
+                  <div className="zip-split-btn" style={{ position: 'relative', display: 'inline-flex' }}>
+                    <button
+                      className="btn btn-secondary btn-lg zip-main"
+                      onClick={() => { setShowEmpZipFmtMenu(false); downloadEmpZip(null, empZipFormat); }}
+                      disabled={!!empCardLoading}
+                      title={`Download one ${empZipFormat === "jpeg" ? "PNG (lossless)" : "PDF"} per employee, packed into a ZIP`}
+                      style={{ borderRadius: '8px 0 0 8px', paddingRight: 10 }}
+                    >
+                      {empCardLoading === 'all_emp_zip'
+                        ? (empGenPhase === 'downloading'
+                            ? <><span className="btn-spinner" /> Downloading…</>
+                            : empGenPhase === 'prefetch'
+                            ? <><span className="btn-spinner" /> Fetching photos…</>
+                            : <><span className="btn-spinner" /> Packing {empGenProgress > 0 ? `${empGenProgress}%` : '…'}</>)
+                        : <><Download size={15} /> Download ZIP ({empZipFormat === 'jpeg' ? 'PNG' : 'PDF'})</>}
+                    </button>
+                    <button
+                      className="btn btn-secondary btn-lg zip-arrow"
+                      onClick={() => setShowEmpZipFmtMenu((v) => !v)}
+                      disabled={!!empCardLoading}
+                      title="Choose ZIP format"
+                      style={{ borderRadius: '0 8px 8px 0', borderLeft: '1px solid rgba(0,0,0,0.15)', paddingLeft: 8, paddingRight: 8 }}
+                    >
+                      <ChevronDown size={14} />
+                    </button>
+                    {showEmpZipFmtMenu && (
+                      <div className="zip-fmt-menu" style={{
+                        position: 'absolute', top: '110%', right: 0, zIndex: 200,
+                        background: 'var(--surface)', border: '1px solid var(--border)',
+                        borderRadius: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.13)',
+                        minWidth: 170, overflow: 'hidden',
+                      }}>
+                        <div style={{ padding: '6px 0' }}>
+                          {[
+                            { val: 'pdf',  label: '📄 PDF', sub: 'Vector — smallest file' },
+                            { val: 'jpeg', label: '🖼️ PNG', sub: '8K lossless PNG — print & zoom proof' },
+                          ].map(({ val, label, sub }) => (
+                            <button
+                              key={val}
+                              onClick={() => { setEmpZipFormat(val); setShowEmpZipFmtMenu(false); }}
+                              style={{
+                                display: 'block', width: '100%', textAlign: 'left',
+                                padding: '8px 14px', border: 'none', cursor: 'pointer',
+                                background: empZipFormat === val ? 'var(--primary-10, #eef2ff)' : 'transparent',
+                                color: 'var(--text-1)',
+                              }}
+                            >
+                              <div style={{ fontWeight: 600, fontSize: 13 }}>{label}</div>
+                              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 1 }}>{sub}</div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
 
