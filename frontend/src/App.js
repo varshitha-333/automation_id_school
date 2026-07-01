@@ -414,12 +414,29 @@ function LoginScreen({ onSuccess, sysStats, initialError }) {
     setBusy(true); setError('');
     try {
       const resume    = getStoredToken();
-      const r = await axios.post(`${API}/login`, { code: code.trim(), resume });
-      saveStoredToken(r.data?.token);
-      onSuccess(r.data);
+      const clientId  = getClientId();
+      const { data } = await axios.post(`${API}/login`,
+        { code: code.trim(),
+          resume_token: resume || undefined,
+          client_id:    clientId },
+        { headers: { 'X-Client-ID': clientId } });
+      if (data?.session_token) {
+        setStoredToken(data.session_token);
+        onSuccess(data);
+      } else {
+        setError('Login failed — no session token returned.');
+      }
     } catch (err) {
-      const msg = err.response?.data?.error || err.message || 'Login failed';
-      setError(msg);
+      const r = err?.response;
+      if (r?.status === 503 && r.data?.code === 'SEATS_FULL') {
+        setError(`Server is full — ${r.data.active_users}/${r.data.max_users} users are already in. Please try again in a few minutes.`);
+      } else if (r?.status === 401) {
+        setError(r.data?.error || 'Invalid access code.');
+      } else if (!r) {
+        setError('Could not reach the server. If you are running locally, try http://127.0.0.1:3000 instead of http://localhost:3000, or restart `npm start`.');
+      } else {
+        setError(`Server error (${r.status}). ` + (r.data?.error || 'Please try again.'));
+      }
     } finally {
       setBusy(false);
     }
