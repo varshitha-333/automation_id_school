@@ -443,21 +443,18 @@ function LoginScreen({ onSuccess, sysStats, initialError }) {
   };
 
   return (
-    <div className="login-screen">
-      <div className="login-box">
-        <div className="login-logo-container">
-          <div className="login-logo-ring">
-            <Lock size={22} className="login-logo-icon" />
-          </div>
-        </div>
-        <h2 className="login-title">Railway ID Card Generator</h2>
-        <p className="login-subtitle">Enter your access code to begin</p>
+    <div className="login-shell">
+      <div className="login-card">
+        <div className="login-icon"><Lock size={26} /></div>
+        <h1 className="login-title">ID Card Admin</h1>
+        <p className="login-sub">Enter your access code to continue</p>
         
         <form onSubmit={submit} className="login-form">
-          <div className="form-group-custom">
-            <KeyRound size={14} className="input-icon-custom" />
+          <div className="login-input-wrap">
+            <KeyRound size={16} className="login-input-icon" />
             <input
-              className="form-input-custom"
+              autoFocus
+              className="login-input"
               type="password"
               placeholder="Access code"
               value={code}
