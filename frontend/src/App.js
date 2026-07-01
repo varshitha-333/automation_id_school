@@ -438,7 +438,7 @@ function LoginScreen({ onSuccess, sysStats, initialError }) {
         
         <form onSubmit={submit} className="login-form">
           <div className="form-group-custom">
-            <Key size={14} className="input-icon-custom" />
+            <KeyRound size={14} className="input-icon-custom" />
             <input
               className="form-input-custom"
               type="password"
